@@ -1,0 +1,19 @@
+{
+  "companyName": "NovaFin",
+  "agentName": "Asha",
+  "agentVoice": "en-IN-natasha",
+  "useCase": "payment_reminder",
+  "language": "en",
+  "customerName": "Ramesh",
+  "accountEnding": "4821",
+  "registeredMobileLastFour": "1234",
+  "amountDue": "8390",
+  "amountDueFormatted": "₹8,390",
+  "dueDate": "June 5, 2026",
+  "daysPastDue": 7,
+  "scenario": "normal_reminder",
+  "requireIdentityVerification": true,
+  "recordingDisclosureRequired": true,
+  "paymentLinkEnabled": true,
+  "humanHandoffEnabled": true
+}

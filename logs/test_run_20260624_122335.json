@@ -1,0 +1,18 @@
+{
+  "scenario": "test_run",
+  "call_started": true,
+  "recording_disclosure_played": false,
+  "identity_verified": false,
+  "amount_disclosed": false,
+  "payment_link_sent": false,
+  "promise_to_pay_date": null,
+  "dispute_detected": false,
+  "payment_reminder_stopped": false,
+  "ticket_created": false,
+  "ticket_id": null,
+  "future_automated_reminders_paused": false,
+  "hardship_detected": false,
+  "human_callback_requested": false,
+  "human_handoff_required": false,
+  "outcome": "unknown"
+}

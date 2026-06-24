@@ -1,0 +1,16 @@
+{
+  "name": "arogya-clinic-dispatch",
+  "trunk_ids": ["<your-inbound-trunk-id>"],
+  "rule": {
+    "dispatchRuleIndividual": {
+      "roomPrefix": "clinic-"
+    }
+  },
+  "roomConfig": {
+    "agents": [
+      {
+        "agentName": "clinic-agent"
+      }
+    ]
+  }
+}
