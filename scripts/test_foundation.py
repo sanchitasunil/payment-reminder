@@ -140,6 +140,22 @@ except Exception as exc:
     check("saved file is valid JSON with fields", False)
     print(f"    ERROR: {exc}")
 
+# ── Test 9: Part 3 required config keys ───────────────────────────────────────
+print("\n=== Test 9: Part 3 required config keys ===")
+PART3_REQUIRED_KEYS = [
+    "companyName", "agentName", "agentVoice", "scenario",
+    "customerName", "registeredMobileLastFour", "amountDueFormatted", "dueDate",
+]
+try:
+    from mock_data import get_config as _get_cfg
+    _cfg = _get_cfg()
+    for k in PART3_REQUIRED_KEYS:
+        check(f"'{k}' present in config", k in _cfg)
+except Exception as exc:
+    for k in PART3_REQUIRED_KEYS:
+        check(f"'{k}' present in config", False)
+    print(f"    ERROR: {exc}")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*45}")
 if _failures == 0:

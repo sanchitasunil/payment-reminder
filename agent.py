@@ -1,7 +1,7 @@
 # Call flow:
 # Phone call → Twilio number → TwiML Bin → LiveKit SIP URI
-# → SIP inbound trunk → dispatch rule → clinic-agent worker
-# → AgentSession (STT(Deepgram or gpt-realtime-whisper) → LLM → TTS(Murf Falcon))  [LLM_PROVIDER=gemini/opencode/openai]
+# → SIP inbound trunk → dispatch rule → payment-agent worker
+# → AgentSession (STT(Deepgram or gpt-realtime-whisper) → LLM → TTS(Murf))  [LLM_PROVIDER=gemini/opencode/openai]
 
 from __future__ import annotations
 
@@ -29,8 +29,20 @@ from livekit.plugins import deepgram, google, openai, silero
 from livekit.plugins import murf
 
 import config  # validates required env vars at import time
-from prompts.system_prompt import build_system_prompt
+from guardrails import GuardrailEngine
+from mock_data import get_config
+from outcome_log import OutcomeLog
+from prompts.payment_prompt import build_payment_prompt
+from state_machine import CallState, CallStateMachine
 from tools.handoff import transfer_to_human
+from tools.payment_tools import (
+    create_dispute_ticket,
+    end_call_wrong_person,
+    flag_hardship,
+    log_promise_to_pay,
+    send_payment_link,
+    verify_borrower_identity,
+)
 from tools.transcript import (
     CallSession,
     infer_intent_from_turns,
@@ -42,8 +54,12 @@ from livekit.agents.voice.events import ConversationItemAddedEvent, UserInputTra
 
 load_dotenv()
 
+cfg = get_config()
+_VOICE = cfg["agentVoice"]
+_LOCALE = "-".join(_VOICE.split("-")[:2])
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("clinic-agent")
+logger = logging.getLogger("payment-agent")
 logger.setLevel(logging.INFO)
 
 # Suppress HTTP/2 frame-level debug noise from Supabase client
@@ -53,19 +69,10 @@ logging.getLogger("h2").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 OPENING_LINE = (
-    "Hello, thank you for calling The Clinic. I'm Matthew, your AI receptionist. "
-    "How may I help you today?"
+    f"Hello, this is {cfg['agentName']}, an automated payment assistance agent from "
+    f"{cfg['companyName']}. This call may be recorded for quality and compliance. "
+    f"Am I speaking with {cfg['customerName']}?"
 )
-
-
-def _opening_line_for_patient(patient_memory: dict | None) -> str:
-    if patient_memory and patient_memory.get("name"):
-        name = patient_memory["name"]
-        return (
-            f"Hello {name}, welcome back to The Clinic. I'm Matthew, your AI receptionist. "
-            f"How can I help you today?"
-        )
-    return OPENING_LINE
 
 
 def _sip_caller_phone(participant: rtc.RemoteParticipant) -> str | None:
@@ -78,16 +85,26 @@ async def _resolve_caller_phone(ctx: JobContext, is_phone: bool) -> str | None:
     if not is_phone:
         return None
 
+    # Only check participants already in the room — don't block session startup
+    # waiting for the SIP leg.  _greet_phone_caller handles the wait.
     for participant in ctx.room.remote_participants.values():
         phone = _sip_caller_phone(participant)
         if phone:
             return phone
 
-    try:
-        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=10.0)
-        return _sip_caller_phone(participant)
-    except asyncio.TimeoutError:
-        return None
+    return None
+
+
+def _update_agent_instructions(
+    session: AgentSession,
+    call_cfg: dict,
+    identity_verified: bool,
+    sm: CallStateMachine,
+) -> None:
+    new_prompt = build_payment_prompt(
+        call_cfg, identity_verified, sm.current_state.value, sm.allowed_actions
+    )
+    asyncio.create_task(session.agent.update_instructions(new_prompt))
 
 
 # ── Pre-synthesized greeting cache ────────────────────────────────────────────
@@ -169,7 +186,7 @@ class CachedGreetingTTS(agents_tts.TTS):
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
-class ClinicAgent(Agent):
+class PaymentAgent(Agent):
     def __init__(self, instructions: str, opening_line: str) -> None:
         chat_ctx = ChatContext()
         chat_ctx.add_message(role="assistant", content=opening_line)
@@ -177,6 +194,12 @@ class ClinicAgent(Agent):
             instructions=instructions,
             chat_ctx=chat_ctx,
             tools=[
+                verify_borrower_identity,
+                send_payment_link,
+                log_promise_to_pay,
+                create_dispute_ticket,
+                flag_hardship,
+                end_call_wrong_person,
                 transfer_to_human,
             ],
         )
@@ -187,11 +210,11 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
 
     # tts_for_calls is kept clean (no asyncio.run() event-loop state).
-    tts_for_calls = murf.TTS(voice="en-US-matthew", locale="en-US")
+    tts_for_calls = murf.TTS(voice=_VOICE, locale=_LOCALE)
 
     async def _synthesise_greeting() -> list[rtc.AudioFrame]:
         # Throwaway instance: used only here so tts_for_calls stays uncontaminated.
-        tts_tmp = murf.TTS(voice="en-US-matthew", locale="en-US")
+        tts_tmp = murf.TTS(voice=_VOICE, locale=_LOCALE)
         frames: list[rtc.AudioFrame] = []
         async with _http_ctx.open():
             async for audio in tts_tmp.synthesize(OPENING_LINE):
@@ -211,7 +234,7 @@ def prewarm(proc: JobProcess) -> None:
 
 
 def _is_phone_room(room_name: str) -> bool:
-    return room_name.startswith("clinic-") and not room_name.startswith("clinic-test-")
+    return room_name.startswith("payment-") and not room_name.startswith("payment-test-")
 
 
 async def _greet_phone_caller(
@@ -266,7 +289,32 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info("Connected to %s (%.1fs)", ctx.room.name, time.monotonic() - t0)
 
-    tts_instance = ctx.proc.userdata.get("tts") or murf.TTS(voice="en-US-matthew", locale="en-US")
+    # Read fresh from disk so trigger_call.py scenario changes take effect
+    # without restarting the worker.
+    call_cfg = get_config()
+
+    outcome_log = OutcomeLog(scenario=call_cfg["scenario"])
+    ctx.proc.userdata["outcome_log"] = outcome_log
+
+    sm = CallStateMachine()
+    guardrails = GuardrailEngine()
+    ctx.proc.userdata["state_machine"] = sm
+    ctx.proc.userdata["guardrails"] = guardrails
+    identity_verified = False
+
+    # ── Pre-call check ──────────────────────────────────────────────────────────
+    can_proceed, block_reason = guardrails.check_pre_call(call_cfg["scenario"])
+    if not can_proceed:
+        logger.warning("Call blocked: %s", block_reason)
+        outcome_log.outcome = "call_blocked"
+        outcome_log.human_handoff_required = True
+        outcome_log.save_to_file()
+        return
+
+    outcome_log.call_started = True
+    outcome_log.recording_disclosure_played = True  # OPENING_LINE always includes the disclosure
+
+    tts_instance = ctx.proc.userdata.get("tts") or murf.TTS(voice=_VOICE, locale=_LOCALE)
 
     session = AgentSession(
         stt=openai.STT(model="gpt-realtime-whisper", use_realtime=True, language="en", api_key=config.OPENAI_API_KEY) if config.STT_PROVIDER == "openai"
@@ -280,8 +328,13 @@ async def entrypoint(ctx: JobContext) -> None:
 
     caller_phone = await _resolve_caller_phone(ctx, is_phone)
 
-    prompt = build_system_prompt()
-    opening_line = _opening_line_for_patient(None)
+    sm.transition(CallState.OPENING_DISCLOSURE)
+    prompt = build_payment_prompt(call_cfg, identity_verified, sm.current_state.value, sm.allowed_actions)
+    opening_line = (
+        f"Hello, this is {call_cfg['agentName']}, an automated payment assistance agent from "
+        f"{call_cfg['companyName']}. This call may be recorded for quality and compliance. "
+        f"Am I speaking with {call_cfg['customerName']}?"
+    )
 
     log_phone = caller_phone.strip() if caller_phone else "unknown"
     call_session = CallSession(phone=log_phone)
@@ -294,6 +347,7 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         transcript_saved = True
         infer_intent_from_turns(call_session)
+        outcome_log.save_to_file()
         await save_transcript(call_session)
         unregister_call_session(ctx.room.name)
 
@@ -304,8 +358,47 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event: UserInputTranscribedEvent) -> None:
-        if event.is_final and event.transcript:
-            call_session.add_turn("user", event.transcript)
+        nonlocal identity_verified
+        utterance = event.transcript
+        if not (event.is_final and utterance):
+            return
+
+        # Wrong person check — only relevant before identity is established
+        if sm.current_state in (CallState.OPENING_DISCLOSURE, CallState.IDENTITY_VERIFICATION):
+            if guardrails.check_wrong_person(utterance, call_cfg["customerName"]):
+                sm.transition(CallState.WRONG_PERSON_END)
+                _update_agent_instructions(session, call_cfg, identity_verified, sm)
+
+        # Guardrail: stop payment flow for dispute / hardship / human request / stop-calling
+        if not sm.is_terminal():
+            stop, reason = guardrails.should_stop_payment_flow(utterance)
+            if stop:
+                if reason == "dispute":
+                    sm.transition(CallState.DISPUTE_INTAKE)
+                elif reason == "hardship":
+                    sm.transition(CallState.HARDSHIP_ESCALATION)
+                elif reason in ("human_requested", "stop_calling"):
+                    sm.transition(CallState.HUMAN_HANDOFF)
+                _update_agent_instructions(session, call_cfg, identity_verified, sm)
+
+        # Normal flow: advance OPENING_DISCLOSURE → IDENTITY_VERIFICATION on first user response
+        # (any reply that didn't trigger wrong_person or a stop-flow guardrail)
+        if sm.current_state == CallState.OPENING_DISCLOSURE:
+            sm.transition(CallState.IDENTITY_VERIFICATION)
+            _update_agent_instructions(session, call_cfg, identity_verified, sm)
+
+        # Identity transition hook — fires on the turn after verify_borrower_identity succeeds
+        if (
+            outcome_log.identity_verified
+            and not identity_verified
+            and sm.current_state == CallState.IDENTITY_VERIFICATION
+        ):
+            identity_verified = True
+            outcome_log.amount_disclosed = True  # amount is revealed in PAYMENT_CONTEXT
+            sm.transition(CallState.PAYMENT_CONTEXT)
+            _update_agent_instructions(session, call_cfg, identity_verified, sm)
+
+        call_session.add_turn("user", utterance)
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event: ConversationItemAddedEvent) -> None:
@@ -313,9 +406,14 @@ async def entrypoint(ctx: JobContext) -> None:
         if item.type == "message" and item.role == "assistant":
             text = item.text_content
             if text:
+                prohibited, phrase = guardrails.is_prohibited_language(text)
+                if prohibited:
+                    logger.warning(
+                        "GUARDRAIL VIOLATION — prohibited language in agent output: %r", phrase
+                    )
                 call_session.add_turn("agent", text)
 
-    await session.start(ClinicAgent(prompt, opening_line), room=ctx.room)
+    await session.start(PaymentAgent(prompt, opening_line), room=ctx.room)
     logger.info("Session started (%.1fs)", time.monotonic() - t0)
 
     if is_phone:
@@ -337,7 +435,7 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            agent_name="clinic-agent",
+            agent_name="payment-agent",
             num_idle_processes=1,
         )
     )

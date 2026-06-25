@@ -1,7 +1,7 @@
 """
-SIP call transfer — forwards the live call to the clinic's real phone number.
+SIP call transfer — forwards the live call to a human agent.
 Uses LiveKit SIP REFER (cold transfer).
-Called when patient requests a human or Aria cannot resolve the query.
+Called when the borrower requests a human or the agent must escalate.
 """
 
 from __future__ import annotations
@@ -18,11 +18,9 @@ from tools.transcript import get_call_session
 
 logger = logging.getLogger(__name__)
 
-CLINIC_FALLBACK = "080-41234567"
-
 
 def _normalize_tel(number: str) -> str:
-    """E.164 for tel: URI."""
+    """Normalise to E.164 tel: URI."""
     cleaned = number.strip().replace(" ", "").replace("-", "")
     if cleaned.startswith("tel:"):
         cleaned = cleaned[4:]
@@ -46,20 +44,17 @@ def _find_sip_participant_identity(room: rtc.Room) -> str | None:
 async def transfer_call(
     room_name: str,
     sip_participant_identity: str,
-    reason: str = "patient request",
+    reason: str = "borrower request",
 ) -> bool:
     """
-    Transfer the active SIP call to the clinic's real phone number.
+    Transfer the active SIP call to the configured human transfer number.
     Returns True on success, False on any failure. Never raises.
     """
     if not config.handoff_enabled():
-        logger.debug("Handoff disabled — skipping SIP REFER")
+        logger.debug("Handoff disabled — HUMAN_TRANSFER_NUMBER or LIVEKIT_SIP_URI not set")
         return False
 
-    if not config.CLINIC_PHONE_NUMBER:
-        return False
-
-    transfer_to = _normalize_tel(config.CLINIC_PHONE_NUMBER)
+    transfer_to = _normalize_tel(config.HUMAN_TRANSFER_NUMBER)  # type: ignore[arg-type]
 
     try:
         async with api.LiveKitAPI(
@@ -76,11 +71,7 @@ async def transfer_call(
                 )
             )
 
-        logger.info(
-            "Call transferred to %s, reason=%s",
-            config.CLINIC_PHONE_NUMBER,
-            reason,
-        )
+        logger.info("Call transferred to human agent, reason=%s", reason)
         return True
     except Exception as exc:
         logger.error("SIP transfer failed: %s", exc)
@@ -93,46 +84,45 @@ async def transfer_to_human(
         str,
         Field(
             description=(
-                "Why the patient needs a human. e.g. 'patient requested', "
-                "'medical question outside scope', 'complaint'"
+                "Why the borrower needs a human agent. "
+                "e.g. 'borrower requested', 'dispute raised', 'hardship escalation', 'complaint'"
             )
         ),
     ],
     context: RunContext,
 ) -> str:
     """
-    Transfer the call to a human at the clinic.
+    Transfer the call to a human support agent.
     Call this when:
-    - The patient explicitly asks to speak to a doctor or human
-    - The patient is distressed and needs immediate human support
-    - The query is a medical question Aria cannot answer
-    - The patient has complained or is frustrated after two attempts
-    - The patient has asked for something outside Aria's scope after one redirect
-    Do NOT call this for routine bookings, FAQs, or cancellations Aria can handle.
-    reason: brief description of why the transfer is needed.
+    - The borrower explicitly asks to speak to a human
+    - A payment dispute or complaint has been raised
+    - A hardship situation requires human review
+    - The borrower asks to stop automated calls
+    reason: brief description of why the escalation is needed.
     """
-    _ = context  # required for tool injection
+    _ = context
 
     job_ctx = get_job_context(required=False)
     if not job_ctx:
         logger.warning("Transfer requested but no job context")
         return (
-            "I wasn't able to connect the transfer. "
-            f"Please call us directly on {CLINIC_FALLBACK}."
+            "I wasn't able to complete the transfer right now. "
+            "A team member will call you back shortly."
         )
 
     sip_identity = _find_sip_participant_identity(job_ctx.room)
     if not sip_identity:
-        logger.warning("Transfer requested but no SIP participant found")
+        logger.warning("Transfer requested but no SIP participant found in room")
         return (
-            "I wasn't able to connect the transfer. "
-            f"Please call us directly on {CLINIC_FALLBACK}."
+            "I wasn't able to complete the transfer right now. "
+            "A team member will call you back shortly."
         )
 
     if not config.handoff_enabled():
-        logger.info("Handoff disabled — no CLINIC_PHONE_NUMBER configured")
+        logger.info("Handoff disabled — HUMAN_TRANSFER_NUMBER not configured")
         return (
-            f"Please call us directly on {CLINIC_FALLBACK} and our team will help you."
+            "I've flagged this for human review. "
+            "A team member from our support team will call you back shortly."
         )
 
     success = await transfer_call(
@@ -144,14 +134,11 @@ async def transfer_to_human(
     if success:
         cs = get_call_session(job_ctx.room.name)
         if cs:
-            cs.set_outcome(intent=cs.intent, outcome="transferred")
+            cs.set_outcome(intent=cs.intent, outcome="transferred_to_human")
 
-        return (
-            "I'm transferring you to our team right now. "
-            "Please hold for just a moment."
-        )
+        return "I'm transferring you to a human agent right now. Please hold for a moment."
 
     return (
-        "I wasn't able to connect the transfer right now. "
-        f"Please call us directly on {CLINIC_FALLBACK}."
+        "I wasn't able to complete the transfer right now. "
+        "A team member will call you back shortly."
     )

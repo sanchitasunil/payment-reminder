@@ -1,6 +1,7 @@
 """
-Call transcript collection and storage.
-Accumulates turns during a call, writes to Supabase on call end.
+Call transcript collection and optional Supabase persistence.
+Accumulates speaker turns during a call, writes to Supabase on call end
+when SUPABASE_URL and SUPABASE_KEY are configured.
 """
 
 from __future__ import annotations
@@ -12,13 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from supabase import create_client
-
 import config
 
 logger = logging.getLogger(__name__)
 
-_active_sessions: dict[str, CallSession] = {}
+_active_sessions: dict[str, "CallSession"] = {}
 
 
 @dataclass
@@ -30,38 +29,27 @@ class Turn:
 
 @dataclass
 class CallSession:
-    """
-    Holds transcript state for one call. One instance per active call,
-    stored on the AgentSession or passed through context.
-    """
+    """Holds transcript state for one call. One instance per active call."""
 
     phone: str
     started_at: float = field(default_factory=time.time)
     turns: list[Turn] = field(default_factory=list)
-    booking_id: str | None = None
     intent: str = "unknown"
     call_outcome: str = "unknown"
 
     def add_turn(self, role: Literal["agent", "user"], text: str) -> None:
-        """Append a turn with timestamp relative to call start."""
         cleaned = text.strip()
         if not cleaned:
             return
+        # Deduplicate consecutive identical turns from the same speaker
         if self.turns and self.turns[-1].role == role and self.turns[-1].text == cleaned:
             return
         relative_ts = round(time.time() - self.started_at, 2)
         self.turns.append(Turn(role=role, text=cleaned, ts=relative_ts))
 
-    def set_outcome(
-        self,
-        intent: str,
-        outcome: str,
-        booking_id: str | None = None,
-    ) -> None:
+    def set_outcome(self, intent: str, outcome: str) -> None:
         self.intent = intent
         self.call_outcome = outcome
-        if booking_id:
-            self.booking_id = booking_id
 
     def to_transcript_json(self) -> list[dict]:
         return [{"role": t.role, "text": t.text, "ts": t.ts} for t in self.turns]
@@ -83,31 +71,46 @@ def get_call_session(room_name: str) -> CallSession | None:
 
 
 def infer_intent_from_turns(session: CallSession) -> None:
-    """Set intent from transcript keywords when not set explicitly."""
+    """Infer payment intent from transcript keywords when not set by a tool."""
     if session.intent != "unknown":
         return
 
     all_text = " ".join(t.text.lower() for t in session.turns)
-    if any(w in all_text for w in ("book", "appointment", "schedule")):
-        session.intent = "booking"
-    elif any(w in all_text for w in ("cancel", "cancellation")):
-        session.intent = "cancellation"
-    elif any(w in all_text for w in ("reschedule", "change", "move")):
-        session.intent = "reschedule"
+
+    if any(w in all_text for w in ("already paid", "paid already", "paid this", "dispute")):
+        session.intent = "payment_dispute"
+    elif any(w in all_text for w in ("lost my job", "cannot pay", "hardship", "medical", "hospital")):
+        session.intent = "hardship"
+    elif any(w in all_text for w in ("promise", "will pay", "pay by", "pay tomorrow")):
+        session.intent = "promise_to_pay"
+    elif any(w in all_text for w in ("wrong number", "wrong person", "not ramesh")):
+        session.intent = "wrong_person"
+    elif any(w in all_text for w in ("stop calling", "remove me", "do not call")):
+        session.intent = "opt_out"
     elif session.turns:
-        session.intent = "faq"
+        session.intent = "general_inquiry"
 
 
 async def save_transcript(session: CallSession) -> bool:
     """
-    Write the completed call session to Supabase call_logs.
-    Called once at the end of every call. Never raises.
-    Returns True on success, False on error.
+    Persist the completed call session to Supabase call_logs.
+    No-ops gracefully when Supabase is not configured.
+    Returns True on success, False on skip or error.
     """
+    if not config.supabase_enabled():
+        logger.info(
+            "Supabase not configured — transcript not persisted "
+            "(%d turns, outcome=%s)",
+            len(session.turns),
+            session.call_outcome,
+        )
+        return False
 
     def _save() -> bool:
         try:
-            client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+            from supabase import create_client
+
+            client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)  # type: ignore[arg-type]
             ended = datetime.now(timezone.utc)
             started = datetime.fromtimestamp(session.started_at, tz=timezone.utc)
 
@@ -118,7 +121,6 @@ async def save_transcript(session: CallSession) -> bool:
                     "ended_at": ended.isoformat(),
                     "duration_seconds": session.duration_seconds(),
                     "transcript": session.to_transcript_json(),
-                    "booking_id": session.booking_id,
                     "intent": session.intent,
                     "call_outcome": session.call_outcome,
                 }
