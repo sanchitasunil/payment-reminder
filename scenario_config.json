@@ -11,7 +11,7 @@
   "amountDueFormatted": "₹8,390",
   "dueDate": "June 5, 2026",
   "daysPastDue": 7,
-  "scenario": "normal_reminder",
+  "scenario": "hardship",
   "requireIdentityVerification": true,
   "recordingDisclosureRequired": true,
   "paymentLinkEnabled": true,

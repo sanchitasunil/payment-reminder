@@ -1,12 +1,18 @@
-# Call flow:
-# Phone call → Twilio number → TwiML Bin → LiveKit SIP URI
-# → SIP inbound trunk → dispatch rule → payment-agent worker
-# → AgentSession (STT(Deepgram or gpt-realtime-whisper) → LLM → TTS(Murf))  [LLM_PROVIDER=gemini/opencode/openai]
+# Outbound call flow (trigger_call.py):
+#   trigger_call.py → LiveKit create_room + create_dispatch (with phone metadata)
+#   → agent entrypoint → session.start() → create_sip_participant via Twilio outbound trunk
+#   → user's phone rings → user answers → 200 OK immediately (agent already ready)
+#   → AgentSession (STT → LLM → TTS(Murf))
+#
+# Inbound fallback (no phone_number in metadata):
+#   SIP INVITE → inbound trunk → dispatch rule → agent entrypoint → _greet_phone_caller
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 
 from dotenv import load_dotenv
@@ -237,45 +243,99 @@ def _is_phone_room(room_name: str) -> bool:
     return room_name.startswith("payment-") and not room_name.startswith("payment-test-")
 
 
+def _get_job_phone(ctx: JobContext) -> str | None:
+    """Return the outbound phone number stored in dispatch metadata by trigger_call.py."""
+    metadata = getattr(ctx.job, "metadata", None)
+    if not metadata:
+        return None
+    try:
+        return json.loads(metadata).get("phone_number")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+
+async def _dial_and_greet(
+    ctx: JobContext,
+    session: AgentSession,
+    t0: float,
+    opening_line: str,
+    phone_number: str,
+) -> None:
+    """Outbound flow: dial the user, wait until they answer, then greet with zero ringback."""
+    from livekit import api as lk_api
+
+    trunk_id = os.environ.get("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "")
+    if not trunk_id:
+        logger.error("LIVEKIT_SIP_OUTBOUND_TRUNK_ID not set — cannot dial outbound")
+        return
+
+    lk = lk_api.LiveKitAPI(
+        url=os.environ["LIVEKIT_URL"],
+        api_key=os.environ["LIVEKIT_API_KEY"],
+        api_secret=os.environ["LIVEKIT_API_SECRET"],
+    )
+    try:
+        logger.info("Dialing %s (trunk %s)...", phone_number, trunk_id)
+        await lk.sip.create_sip_participant(
+            lk_api.CreateSIPParticipantRequest(
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone_number,
+                room_name=ctx.room.name,
+                participant_identity="phone-user",
+                wait_until_answered=True,
+            )
+        )
+        logger.info("User answered at %.1fs", time.monotonic() - t0)
+    except Exception:
+        logger.exception("Outbound SIP call failed")
+        return
+    finally:
+        await lk.aclose()
+
+    # Participant joins as soon as user answers — find them (may need a brief moment)
+    participant: rtc.RemoteParticipant | None = ctx.room.remote_participants.get("phone-user")
+    if participant is None:
+        try:
+            participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error("SIP participant didn't appear after answering")
+            return
+
+    session.room_io.set_participant(participant.identity)
+    handle = session.say(opening_line, allow_interruptions=False)
+    logger.info("Greeting started at %.1fs", time.monotonic() - t0)
+    await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
+    logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
+
+
 async def _greet_phone_caller(
     ctx: JobContext,
     session: AgentSession,
     t0: float,
     opening_line: str,
 ) -> None:
-    """Play opening greeting; TTS is fired immediately to overlap with participant-join wait."""
-    handle = session.say(opening_line, allow_interruptions=False)
-    logger.info("Greeting started at %.1fs", time.monotonic() - t0)
-
+    """Inbound fallback: SIP participant created by dispatch rule, greet when they join."""
     participant: rtc.RemoteParticipant | None = None
     for p in ctx.room.remote_participants.values():
         participant = p
-        logger.info(
-            "Caller already in room: %s (%s)",
-            p.identity,
-            rtc.ParticipantKind.Name(p.kind),
-        )
+        logger.info("Caller already in room: %s (%s)", p.identity, rtc.ParticipantKind.Name(p.kind))
         break
 
     if participant is None:
         try:
             participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=20.0)
             logger.info(
-                "Caller joined: %s (%s) at %.1fs",
+                "Caller joined: %s at %.1fs",
                 participant.identity,
-                rtc.ParticipantKind.Name(participant.kind),
                 time.monotonic() - t0,
             )
         except asyncio.TimeoutError:
-            logger.error(
-                "No caller in %s after 20s — remote=%s",
-                ctx.room.name,
-                list(ctx.room.remote_participants.keys()),
-            )
+            logger.error("No caller in %s after 20s", ctx.room.name)
             return
 
     session.room_io.set_participant(participant.identity)
-
+    handle = session.say(opening_line, allow_interruptions=False)
+    logger.info("Greeting started at %.1fs", time.monotonic() - t0)
     await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
     logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
 
@@ -326,7 +386,10 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=ctx.proc.userdata["vad"],
     )
 
-    caller_phone = await _resolve_caller_phone(ctx, is_phone)
+    # Outbound: phone number comes from dispatch metadata.
+    # Inbound fallback: extract from SIP participant attributes.
+    outbound_phone = _get_job_phone(ctx) if is_phone else None
+    caller_phone = outbound_phone or await _resolve_caller_phone(ctx, is_phone)
 
     sm.transition(CallState.OPENING_DISCLOSURE)
     prompt = build_payment_prompt(call_cfg, identity_verified, sm.current_state.value, sm.allowed_actions)
@@ -418,11 +481,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
     if is_phone:
         try:
-            await _greet_phone_caller(ctx, session, t0, opening_line)
+            if outbound_phone:
+                await _dial_and_greet(ctx, session, t0, opening_line, outbound_phone)
+            else:
+                await _greet_phone_caller(ctx, session, t0, opening_line)
         except asyncio.TimeoutError:
-            logger.error("Phone greeting timed out — call may have dropped")
+            logger.error("Phone call timed out")
         except Exception:
-            logger.exception("Phone greeting failed")
+            logger.exception("Phone call failed")
     while ctx.room.isconnected():
         await asyncio.sleep(0.25)
 
