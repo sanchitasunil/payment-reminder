@@ -1,9 +1,10 @@
 """Test post-call WhatsApp confirmations without placing a call.
 
+Sends a real WhatsApp message by default via Twilio.
+
 Usage:
   python scripts/test_whatsapp.py --outcome promise_to_pay --phone +919880026511
   python scripts/test_whatsapp.py --outcome hardship --dry-run
-  python scripts/test_whatsapp.py --outcome dispute --send
   python scripts/test_whatsapp.py --list-outcomes
 
 Outcomes: promise_to_pay, dispute, hardship, escalation, payment_link,
@@ -24,10 +25,9 @@ if hasattr(sys.stdout, "reconfigure"):
 import config
 from mock_data import get_config
 from outcome_log import OutcomeLog
-from tools.transcript import CallSession, Turn
+from tools.transcript import CallSession
 from tools.whatsapp import (
     build_whatsapp_message,
-    send_post_call_whatsapp,
     send_whatsapp_message,
     should_send_whatsapp,
 )
@@ -181,13 +181,7 @@ def divider(char: str = "-", width: int = 70) -> None:
     print(char * width)
 
 
-async def _run_scenario(
-    name: str,
-    phone: str,
-    *,
-    dry_run: bool,
-    send: bool,
-) -> int:
+async def _run_scenario(name: str, phone: str, *, dry_run: bool) -> int:
     spec = SCENARIOS[name]
     cfg = get_config()
 
@@ -224,39 +218,30 @@ async def _run_scenario(
         print("  OK — correctly skipped")
         return 0
 
-    if send:
-        if not config.whatsapp_enabled():
-            print("  ERROR: Twilio WhatsApp not configured.")
-            print("  Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM in .env")
-            return 1
-        result = send_whatsapp_message(phone, message, dry_run=False)
-    else:
-        result = await send_post_call_whatsapp(
-            outcome_log, session, cfg, dry_run=dry_run or not send
-        )
+    if dry_run:
+        print(f"  DRY RUN — would send to whatsapp:{phone.lstrip('+') if phone.startswith('+') else phone}")
+        return 0
 
-    if result is None:
-        print("  ERROR: expected send but got None")
+    if not config.whatsapp_enabled():
+        print("  ERROR: Twilio WhatsApp not configured.")
+        print("  Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM in .env")
         return 1
+
+    result = send_whatsapp_message(phone, message, dry_run=False)
 
     if result.get("sent"):
         print(f"  SENT — Twilio SID: {result['sid']}")
         print(f"  To: {result['to']}")
         return 0
 
-    reason = result.get("reason", "unknown")
-    if dry_run or reason == "dry_run":
-        print(f"  DRY RUN — would send to {result.get('to')}")
-        return 0
-
-    print(f"  NOT SENT — reason: {reason}")
-    return 1 if send else 0
+    print(f"  NOT SENT — reason: {result.get('reason', 'unknown')}")
+    return 1
 
 
 async def _run_all(phone: str, *, dry_run: bool) -> int:
     failures = 0
     for name in SCENARIOS:
-        code = await _run_scenario(name, phone, dry_run=dry_run, send=False)
+        code = await _run_scenario(name, phone, dry_run=dry_run)
         if code != 0:
             failures += 1
         print()
@@ -266,7 +251,7 @@ async def _run_all(phone: str, *, dry_run: bool) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Test post-call WhatsApp without placing a call",
+        description="Test post-call WhatsApp without placing a call (sends by default)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -283,17 +268,12 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Build and validate the message without sending (default)",
-    )
-    parser.add_argument(
-        "--send",
-        action="store_true",
-        help="Actually send via Twilio (requires WhatsApp sandbox or approved sender)",
+        help="Preview the message without sending via Twilio",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Run every scenario (always dry-run unless --send is also set)",
+        help="Run every scenario",
     )
     parser.add_argument(
         "--list-outcomes",
@@ -309,17 +289,10 @@ def main() -> None:
             print(f"  {name:<16} [{flag}]  {spec['description']}")
         return
 
-    dry_run = args.dry_run or not args.send
-
     if args.all:
-        sys.exit(asyncio.run(_run_all(args.phone, dry_run=dry_run or not args.send)))
+        sys.exit(asyncio.run(_run_all(args.phone, dry_run=args.dry_run)))
 
-    sys.exit(asyncio.run(_run_scenario(
-        args.outcome,
-        args.phone,
-        dry_run=dry_run,
-        send=args.send,
-    )))
+    sys.exit(asyncio.run(_run_scenario(args.outcome, args.phone, dry_run=args.dry_run)))
 
 
 if __name__ == "__main__":

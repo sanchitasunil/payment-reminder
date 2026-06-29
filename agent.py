@@ -1,5 +1,5 @@
-# Outbound call flow (trigger_call.py):
-#   trigger_call.py → LiveKit create_room + create_dispatch (with phone metadata)
+# Outbound call flow:
+#   trigger call → LiveKit create_room + create_dispatch (with phone metadata)
 #   → agent entrypoint → session.start() → create_sip_participant via Twilio outbound trunk
 #   → user's phone rings → user answers → 200 OK immediately (agent already ready)
 #   → AgentSession (STT → LLM → TTS(Murf))

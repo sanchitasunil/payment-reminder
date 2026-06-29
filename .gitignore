@@ -10,5 +10,5 @@ build/
 .pytest_cache/
 .mypy_cache/
 .cursorrules
-.lancedb/
 service-account.json
+logs/*.json

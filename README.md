@@ -13,210 +13,187 @@ An outbound AI voice agent that calls borrowers, verifies their identity, presen
 ## What it does
 
 - **Dials outbound** via Twilio PSTN → LiveKit SIP outbound trunk, speaks with Murf Falcon TTS
-- **Pre-synthesizes the opening greeting** during worker startup so the borrower hears audio the instant they pick up — no TTS latency on the first line
 - **Verifies borrower identity** using the last four digits of their registered mobile number before disclosing any account details
 - **Presents payment context** — amount due, due date, and a payment link sent to their registered number
 - **Records a promise to pay** with a commitment date when the borrower agrees
-- **Stops the payment flow immediately** if the borrower disputes, reports hardship, asks to stop being called, or requests a human — guardrails fire before the LLM can respond
+- **Stops the payment flow immediately** if the borrower disputes, reports hardship, asks to stop being called, or requests a human
 - **Blocks the call entirely** when the account has an active grievance ticket
-- **Logs a structured outcome file** (`logs/`) after every call — identity verified, dispute detected, ticket ID, outcome label, etc.
+- **Logs structured outcome and transcript files** (`logs/`) after every call
 - **Persists call transcripts** to Supabase when configured
+- **Sends post-call WhatsApp confirmations** via Twilio when configured
 - **Transfers to a human agent** via SIP REFER when escalation is needed
+
+---
+
+## Project structure
+
+```
+payment-reminder/
+├── agent.py              # LiveKit agent worker (entrypoint, session, greeting)
+├── run.py                # Main CLI — single call, CSV campaign, or text-mode test
+├── config.py             # Environment variable loading and validation
+├── mock_data.py          # Per-call config (scenario_config.json + dispatch metadata)
+├── guardrails.py         # Pre-call checks and utterance-level compliance rules
+├── state_machine.py      # Call state transitions and allowed actions per state
+├── outcome_log.py        # Structured outcome JSON written after each call
+├── scenario_config.json  # Default borrower/company details for single-call mode
+├── reminders.csv         # Example campaign CSV
+├── dispatch-rule.json    # LiveKit dispatch rule reference (paste into Cloud console)
+├── prompts/
+│   └── payment_prompt.py # System prompt builder (per state)
+├── tools/
+│   ├── payment_tools.py  # Agent tools: verify identity, send link, log PTP, etc.
+│   ├── handoff.py        # SIP transfer to human agent
+│   ├── transcript.py     # Transcript collection and Supabase persistence
+│   └── whatsapp.py       # Post-call WhatsApp confirmations
+├── scripts/
+│   ├── setup_outbound_trunk.py  # One-time Twilio → LiveKit SIP trunk setup
+│   ├── run_scenario.py          # Dry-run scenario preview (no phone/API)
+│   └── test_whatsapp.py         # Test WhatsApp message templates
+└── logs/                 # Runtime output (outcome JSON + transcripts)
+```
 
 ---
 
 ## Call flow
 
 ```
-trigger_call.py
-  -> LiveKit: create room + create dispatch (phone number in metadata)
-    -> agent worker: prewarm (VAD + greeting pre-synthesis)
-      -> entrypoint: session.start()
-        -> create_sip_participant (outbound trunk -> Twilio -> PSTN)
-          -> borrower's phone rings
-            -> borrower answers -> 200 OK
-              -> agent greets immediately (cached audio, no TTS delay)
+run.py
+  → LiveKit: create room + create dispatch (phone + borrower metadata)
+    → agent worker: prewarm (VAD + Murf TTS)
+      → entrypoint: session.start()
+        → create_sip_participant (outbound trunk → Twilio → PSTN)
+          → borrower's phone rings → borrower answers
+            → agent greets and begins conversation
 ```
 
 ### State machine
 
 ```
 PRE_CALL_CHECK
-  -> OPENING_DISCLOSURE       (agent introduces itself, asks "Am I speaking with <name>?")
-    -> IDENTITY_VERIFICATION  (last four digits of registered mobile)
-      -> PAYMENT_CONTEXT      (amount, due date, offer payment link)
-        -> INTENT_CLASSIFICATION
-          -> SEND_PAYMENT_LINK  -> PROMISE_TO_PAY  -> CALL_SUMMARY
-          -> DISPUTE_INTAKE     -> HUMAN_HANDOFF
-          -> HARDSHIP_ESCALATION -> HUMAN_HANDOFF
-  -> WRONG_PERSON_END         (any state — triggered by guardrail)
-  -> HUMAN_HANDOFF            (any state — triggered by guardrail)
+  → OPENING_DISCLOSURE       (agent introduces itself, asks "Am I speaking with <name>?")
+    → IDENTITY_VERIFICATION  (last four digits of registered mobile)
+      → PAYMENT_CONTEXT      (amount, due date, offer payment link)
+        → INTENT_CLASSIFICATION
+          → SEND_PAYMENT_LINK  → PROMISE_TO_PAY  → CALL_SUMMARY
+          → DISPUTE_INTAKE     → HUMAN_HANDOFF
+          → HARDSHIP_ESCALATION → HUMAN_HANDOFF
+  → WRONG_PERSON_END         (any state — triggered by guardrail)
+  → HUMAN_HANDOFF            (any state — triggered by guardrail)
 ```
-
-Guardrails run on every user utterance and override the LLM routing decision: dispute phrases → `DISPUTE_INTAKE`, hardship phrases → `HARDSHIP_ESCALATION`, "stop calling" or human request → `HUMAN_HANDOFF`, wrong person → `WRONG_PERSON_END`. The agent never discloses account details to an unverified or wrong-person caller.
 
 ---
 
-## Contents
+## Quick start
 
-1. [Quick start](#1-quick-start)
-2. [Environment variables](#2-environment-variables)
-3. [LLM and STT providers](#3-llm-and-stt-providers)
-4. [Telephony setup](#4-telephony-setup)
-5. [Scenarios](#5-scenarios)
-6. [Testing without a phone](#6-testing-without-a-phone)
-7. [Triggering a real call](#7-triggering-a-real-call)
-8. [Transcript logging and outcome files](#8-transcript-logging-and-outcome-files)
-9. [Adapting for your use case](#9-adapting-for-your-use-case)
-10. [Common errors](#10-common-errors)
-
----
-
-## 1. Quick start
-
-### Clone
-
-```bash
-git clone <repo-url>
-cd payment-reminder
-```
-
-### Create a virtual environment
+### 1. Install
 
 ```bash
 python -m venv venv
-```
-
-```bash
-# macOS / Linux
-source venv/bin/activate
-```
-
-```powershell
-# Windows
-venv\Scripts\Activate.ps1
-```
-
-### Install dependencies
-
-```bash
+venv\Scripts\Activate.ps1        # Windows
+# source venv/bin/activate       # macOS / Linux
 pip install -r requirements.txt
 ```
 
-### Configure environment variables
-
-```bash
-# macOS / Linux
-cp .env.example .env
-```
+### 2. Configure
 
 ```powershell
-# Windows
-Copy-Item .env.example .env
+Copy-Item .env.example .env      # Windows
+# cp .env.example .env           # macOS / Linux
 ```
 
-Fill in `.env`. See [Environment variables](#2-environment-variables) for where to find each value.
+Fill in `.env`. See [Environment variables](#environment-variables) below.
 
-### Download VAD model
+### 3. Download VAD model
 
 ```bash
 python agent.py download-files
 ```
 
-Downloads Silero VAD weights. Watch for the confirmation line in the output.
+### 4. Set up telephony (one time)
 
-### Run the agent worker
+See [Telephony setup](#telephony-setup).
 
-```bash
-# Browser / playground testing — no phone needed
-python agent.py dev
-
-# Phone testing — stable, no file-watcher restarts
-python agent.py start
-```
-
-### Trigger a call (separate terminal)
+### 5. Run
 
 ```bash
-python scripts/trigger_call.py --to +919876543210
+# Single outbound call (uses scenario_config.json for borrower details)
+python run.py --to +919876543210
+
+# Campaign from CSV (sequential — one call at a time)
+python run.py --csv reminders.csv
+
+# Campaign from CSV (parallel — all calls at once)
+python run.py --csv reminders.csv --mode parallel
+
+# Text mode — type the caller's responses in the terminal
+python run.py --to +919876543210 --text
 ```
 
-The agent dials the number, your phone rings in ~3–5 s. When you answer, Asha speaks immediately.
+`run.py` starts the agent worker automatically and dispatches the call.
 
 ---
 
-## 2. Environment variables
+## Environment variables
 
 **Required**
 
 | Variable | Where to get it |
 |---|---|
-| `LIVEKIT_URL` | [LiveKit Cloud](https://cloud.livekit.io) dashboard > your project |
-| `LIVEKIT_API_KEY` | LiveKit Cloud > Settings > API Keys |
+| `LIVEKIT_URL` | [LiveKit Cloud](https://cloud.livekit.io) dashboard |
+| `LIVEKIT_API_KEY` | LiveKit Cloud → Settings → API Keys |
 | `LIVEKIT_API_SECRET` | Same page as API key |
-| `MURF_API_KEY` | [murf.ai/api/dashboard](https://murf.ai/api/dashboard) > Settings > API |
-| `STT_PROVIDER` | `deepgram` (default) or `openai` — see [LLM and STT providers](#3-llm-and-stt-providers) |
-| `DEEPGRAM_API_KEY` | [console.deepgram.com](https://console.deepgram.com) — required if `STT_PROVIDER=deepgram` |
-| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) — required if `STT_PROVIDER=openai` or `LLM_PROVIDER=openai` |
-| `LLM_PROVIDER` | `gemini` (default), `openai`, or `opencode` — see [LLM and STT providers](#3-llm-and-stt-providers) |
-| `GOOGLE_API_KEY` | [aistudio.google.com](https://aistudio.google.com) — required if `LLM_PROVIDER=gemini` |
-| `OPENCODE_API_KEY` | [opencode.ai](https://opencode.ai) — required if `LLM_PROVIDER=opencode` |
-| `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` | Run `python scripts/setup_outbound_trunk.py` once — see [Telephony setup](#4-telephony-setup) |
+| `MURF_API_KEY` | [murf.ai/api/dashboard](https://murf.ai/api/dashboard) |
+| `STT_PROVIDER` | `deepgram` (default) or `openai` |
+| `DEEPGRAM_API_KEY` | [console.deepgram.com](https://console.deepgram.com) — if `STT_PROVIDER=deepgram` |
+| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) — if `STT_PROVIDER=openai` or `LLM_PROVIDER=openai` |
+| `LLM_PROVIDER` | `gemini` (default), `openai`, or `opencode` |
+| `GOOGLE_API_KEY` | [aistudio.google.com](https://aistudio.google.com) — if `LLM_PROVIDER=gemini` |
+| `OPENCODE_API_KEY` | [opencode.ai](https://opencode.ai) — if `LLM_PROVIDER=opencode` |
+| `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` | Run `python scripts/setup_outbound_trunk.py` once |
 
 **Optional**
 
 | Variable | What it enables |
 |---|---|
-| `LIVEKIT_SIP_URI` | SIP REFER transfers to a human agent (human handoff over PSTN) |
+| `LIVEKIT_SIP_URI` | SIP REFER transfers to a human agent |
 | `HUMAN_TRANSFER_NUMBER` | Phone number to transfer to when the agent escalates |
-| `SUPABASE_URL` | Persist call transcripts to Supabase |
-| `SUPABASE_KEY` | Same — anon/public key from Supabase > Settings > API |
-| `TWILIO_ACCOUNT_SID` | Needed for `setup_outbound_trunk.py` and call monitoring scripts |
-| `TWILIO_AUTH_TOKEN` | Same |
-| `TWILIO_PHONE_NUMBER` | Your Twilio number in E.164 format (e.g. `+12015551234`) |
+| `SUPABASE_URL` / `SUPABASE_KEY` | Persist call transcripts to Supabase |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | WhatsApp confirmations and trunk setup |
+| `TWILIO_PHONE_NUMBER` | Caller ID on outbound calls |
+| `TWILIO_WHATSAPP_FROM` | Post-call WhatsApp sender (e.g. `whatsapp:+14155238886`) |
 
 ---
 
-## 3. LLM and STT providers
+## LLM and STT providers
 
-Both are configurable via `.env` with no code changes.
+Set in `.env` — no code changes needed.
 
-### LLM
-
-Set `LLM_PROVIDER` in `.env`:
-
-| Value | Model | API key needed |
+| `LLM_PROVIDER` | Model | API key |
 |---|---|---|
 | `gemini` | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
 | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | `opencode` | `kimi-k2.5` | `OPENCODE_API_KEY` |
 
-### STT
-
-Set `STT_PROVIDER` in `.env`:
-
-| Value | Model | API key needed | Notes |
-|---|---|---|---|
-| `deepgram` | `nova-3` | `DEEPGRAM_API_KEY` | Default, low latency |
-| `openai` | `gpt-realtime-whisper` | `OPENAI_API_KEY` | Word-by-word streaming via OpenAI Realtime API |
+| `STT_PROVIDER` | Model | API key |
+|---|---|---|
+| `deepgram` | `nova-3` | `DEEPGRAM_API_KEY` |
+| `openai` | `gpt-realtime-whisper` | `OPENAI_API_KEY` |
 
 ---
 
-## 4. Telephony setup
-
-The agent makes outbound calls via a LiveKit SIP outbound trunk backed by a Twilio Elastic SIP trunk.
+## Telephony setup
 
 ### Step 1 — Twilio Elastic SIP trunk
 
-1. [console.twilio.com](https://console.twilio.com) > Elastic SIP Trunking > Trunks > **Create new trunk**
-2. Give it a name and click **Create**
-3. Open the trunk > **Termination** > note the **Termination SIP URI** (e.g. `mytrunk.pstn.twilio.com`)
-4. Termination > **Credential Lists** > create a username and password
+1. [console.twilio.com](https://console.twilio.com) → Elastic SIP Trunking → Create trunk
+2. Termination tab → note the SIP URI (e.g. `mytrunk.pstn.twilio.com`)
+3. Create a credential list (username + password) and attach it to the trunk
 
 Add to `.env`:
 
 ```env
-TWILIO_SIP_TRUNK_URI=mytrunk.pstn.twilio.com
+TWILIO_SIP_TERM_URI=mytrunk.pstn.twilio.com
 TWILIO_SIP_USERNAME=your-username
 TWILIO_SIP_PASSWORD=your-password
 TWILIO_PHONE_NUMBER=+12015551234
@@ -228,204 +205,124 @@ TWILIO_PHONE_NUMBER=+12015551234
 python scripts/setup_outbound_trunk.py
 ```
 
-This reads the `TWILIO_SIP_*` vars from `.env`, creates the LiveKit outbound SIP trunk, and prints:
-
-```
-LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_xxxxxxxxxxxxxxxxx
-```
-
-Add that value to `.env`.
+Copy the printed `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` into `.env`.
 
 ### Step 3 — LiveKit dispatch rule
 
-The dispatch rule tells LiveKit which agent worker handles each room.
-
-1. [LiveKit Cloud](https://cloud.livekit.io) > Telephony > Dispatch Rules > **Create new rule**
-2. Switch to the JSON editor and paste:
+In [LiveKit Cloud](https://cloud.livekit.io) → Telephony → Dispatch Rules, paste the contents of `dispatch-rule.json`:
 
 ```json
 {
-  "name": "payment-dispatch",
+  "name": "payment-agent",
   "rule": {
     "dispatchRuleIndividual": {
       "roomPrefix": "payment-"
     }
   },
   "roomConfig": {
-    "agents": [
-      { "agentName": "payment-agent" }
-    ]
+    "agents": [{ "agentName": "payment-agent" }]
   }
 }
 ```
 
-> The `agentName` must match exactly. A rule without the `agents` block will receive the dispatch but the agent will never start.
+The `agentName` must match exactly.
 
 ### Step 4 — Human handoff (optional)
-
-To enable live SIP transfers when the agent escalates:
-
-1. Add to `.env`:
 
 ```env
 LIVEKIT_SIP_URI=abc123.sip.livekit.cloud
 HUMAN_TRANSFER_NUMBER=+918041234567
 ```
 
-2. Enable **SIP REFER** in Twilio: Elastic SIP Trunking > your trunk > General > **Call Transfer (SIP REFER)** toggle.
-
-If `HUMAN_TRANSFER_NUMBER` is unset, the agent reads the number aloud instead of transferring.
-
-### Diagnosis scripts
-
-```bash
-python scripts/check_dispatch.py       # verify dispatch rule is wired correctly
-python scripts/check_twilio_calls.py   # view recent Twilio call logs
-python scripts/fix_sip_trunk.py        # update SIP trunk credentials if they change
-```
+Enable **SIP REFER** in Twilio: Elastic SIP Trunking → your trunk → Call Transfer (SIP REFER).
 
 ---
 
-## 5. Scenarios
+## Scenarios
 
-Scenarios are set in `scenario_config.json`. The `trigger_call.py` script can switch the scenario before each call.
+For single-call mode (`--to`), borrower details come from `scenario_config.json`.
+For campaigns (`--csv`), each row supplies its own details; `scenario` is always `normal_reminder`.
 
 | Scenario | What happens |
 |---|---|
-| `normal_reminder` | Identity verified → amount disclosed → payment link sent → promise to pay recorded |
-| `already_paid` | Borrower says "I already paid" → guardrail fires → dispute ticket created → human handoff |
-| `hardship` | Borrower says "I lost my job" → guardrail fires → account flagged → human callback arranged |
-| `wrong_person` | Someone else answers → guardrail fires → call ends, amount never disclosed |
-| `grievance_pending` | Active grievance on file → call blocked before it starts |
+| `normal_reminder` | Identity verified → amount disclosed → payment link → promise to pay |
+| `already_paid` | Borrower disputes → dispute ticket → human handoff |
+| `hardship` | Borrower reports hardship → account flagged → human callback |
+| `wrong_person` | Wrong person answers → call ends, amount never disclosed |
+| `grievance_pending` | Active grievance → call blocked before it starts |
 
-Trigger a specific scenario:
-
-```bash
-python scripts/trigger_call.py --to +919876543210 --scenario hardship
-```
-
-Edit `scenario_config.json` directly to change customer name, amount, due date, or account details. The agent worker reads this file fresh on every call — no restart needed.
-
----
-
-## 6. Testing without a phone
-
-Preview what the agent would do for any scenario — no LiveKit connection, no phone, no API calls:
+Preview a scenario without placing a call:
 
 ```bash
 python scripts/run_scenario.py --scenario normal_reminder
-python scripts/run_scenario.py --scenario already_paid
-python scripts/run_scenario.py --scenario hardship
-python scripts/run_scenario.py --scenario wrong_person
 python scripts/run_scenario.py --scenario grievance_pending
 ```
 
-Output includes: config values, pre-call check result, expected state machine path, opening line, initial system prompt, sample exchange, and expected outcome log.
+---
 
-Other unit-level tests:
+## CSV campaign format
+
+`reminders.csv` columns:
+
+| Column | Required | Notes |
+|---|---|---|
+| `name` | yes | Borrower name |
+| `phone` | yes | E.164 format: `+919880026511` |
+| `amount_due` | yes | Plain integer |
+| `due_date` | yes | e.g. `June 21, 2026` |
+| `account_ending` | yes | Last four digits of account |
+| `registered_mobile_last_four` | yes | For identity verification |
+
+---
+
+## Logs
+
+After each call, two files are written to `logs/`:
+
+- **Outcome log** — `logs/<scenario>_<timestamp>.json` (identity verified, dispute detected, outcome label, etc.)
+- **Transcript** — `logs/<name>_<last4>.json` (full conversation turns)
+
+Possible `outcome` values: `promise_to_pay`, `payment_dispute`, `hardship_detected`, `identity_mismatch`, `call_blocked`, `transferred_to_human`, `unknown`.
+
+---
+
+## Testing utilities
 
 ```bash
-python scripts/test_state_machine.py   # all state transitions and terminal states
-python scripts/test_guardrails.py      # dispute / hardship / wrong person / prohibited language detection
-python scripts/test_tools.py           # payment tools (verify identity, send link, log PTP, etc.)
-python scripts/test_prompt.py          # system prompt rendering for each state
-python scripts/test_foundation.py      # env vars and config load
-python scripts/test_murf_voice.py      # Murf TTS API connectivity
-python scripts/test_dispatch.py        # LiveKit dispatch rule check
-```
+# Preview scenario flow and prompts (no API calls)
+python scripts/run_scenario.py --scenario hardship
 
-For browser-based voice testing (no phone needed):
+# Test WhatsApp message templates
+python scripts/test_whatsapp.py --outcome promise_to_pay --dry-run
+python scripts/test_whatsapp.py --list-outcomes
 
-```bash
+# Browser-based voice testing (no phone)
 python agent.py dev
 ```
 
-Open the [LiveKit Agents Playground](https://agents-playground.livekit.io/), connect with your LiveKit URL, API key, and secret, and speak to the agent with your microphone.
+Open the [LiveKit Agents Playground](https://agents-playground.livekit.io/) and connect with your LiveKit credentials.
 
 ---
 
-## 7. Triggering a real call
+## Adapting for your use case
 
-```bash
-# Normal payment reminder
-python scripts/trigger_call.py --to +919876543210
-
-# With a specific scenario
-python scripts/trigger_call.py --to +919876543210 --scenario already_paid
-```
-
-The script:
-1. Checks required env vars are set
-2. Optionally updates `scenario_config.json` to the requested scenario
-3. Runs the pre-call guardrail check (prints `[BLOCKED]` and exits for `grievance_pending`)
-4. Creates a LiveKit room named `payment-<id>`
-5. Dispatches `payment-agent` to that room with the phone number in job metadata
-6. The agent dials the number — your phone rings in ~3–5 s
-
-Watch the agent terminal for the room name and call progress. Outcome log is written to `logs/` when the call ends.
+| What to change | File |
+|---|---|
+| Company name, agent name, voice | `scenario_config.json` |
+| System prompt and call script | `prompts/payment_prompt.py` |
+| Guardrail phrases | `guardrails.py` |
+| Call states and transitions | `state_machine.py` |
+| Payment tools (replace mocks with real APIs) | `tools/payment_tools.py` |
 
 ---
 
-## 8. Transcript logging and outcome files
+## Common errors
 
-### Outcome log
-
-Every call writes a JSON file to `logs/<scenario>_<timestamp>.json`:
-
-```json
-{
-  "scenario": "normal_reminder",
-  "call_started": true,
-  "recording_disclosure_played": true,
-  "identity_verified": true,
-  "amount_disclosed": true,
-  "payment_link_sent": true,
-  "promise_to_pay_date": "June 25, 2026",
-  "dispute_detected": false,
-  "payment_reminder_stopped": false,
-  "ticket_created": false,
-  "ticket_id": null,
-  "future_automated_reminders_paused": false,
-  "hardship_detected": false,
-  "human_callback_requested": false,
-  "human_handoff_required": false,
-  "outcome": "promise_to_pay"
-}
-```
-
-Possible `outcome` values: `promise_to_pay`, `payment_dispute`, `hardship_detected`, `identity_mismatch`, `call_blocked`, `unknown`.
-
-### Transcript persistence (Supabase)
-
-When `SUPABASE_URL` and `SUPABASE_KEY` are set, the full call transcript is saved to Supabase after the call ends. Without them, the agent logs locally only — the call still works normally.
-
----
-
-## 9. Adapting for your use case
-
-The payment collection workflow is a thin layer on top of the voice pipeline. The state machine, guardrails, tools, and transcript logging are all configurable.
-
-| What to change | File | What to update |
-|---|---|---|
-| Company name, agent name, voice | `scenario_config.json` | `companyName`, `agentName`, `agentVoice` |
-| System prompt and call script | `prompts/payment_prompt.py` | Prompt per state |
-| Guardrail phrases | `guardrails.py` | Dispute, hardship, wrong person phrase lists |
-| Call states and allowed transitions | `state_machine.py` | `CallState`, `VALID_TRANSITIONS`, `ALLOWED_ACTIONS` |
-| Payment tools | `tools/payment_tools.py` | Replace mock implementations with real API calls |
-| Voice | `scenario_config.json` | `agentVoice` — see [murf.ai/voices](https://murf.ai/api/dashboard) |
-
-To hook into a real loan management system, replace the mock functions in `tools/payment_tools.py` with actual API calls. The tool contracts (function signatures and return strings) stay the same.
-
----
-
-## 10. Common errors
-
-| Error | Cause | Fix |
-|---|---|---|
-| `Required environment variable 'X' is not set` | Missing `.env` value | Copy `.env.example` to `.env` and fill in the variable |
-| `LIVEKIT_SIP_OUTBOUND_TRUNK_ID not set — cannot dial outbound` | Trunk not created | Run `python scripts/setup_outbound_trunk.py` and add the printed ID to `.env` |
-| Phone rings but agent stays silent | Dispatch rule has no `agents` block | Edit the rule in LiveKit Cloud — add `agentName: payment-agent` to `roomConfig.agents` |
-| `DuplexClosed` in logs, call drops mid-greeting | `dev` mode restarts on file save | Use `python agent.py start` for all phone testing |
-| Agent answers but immediately says goodbye | `grievance_pending` scenario is active | Change `scenario` in `scenario_config.json` or pass `--scenario normal_reminder` to `trigger_call.py` |
-| `401` or `403` from Murf or Deepgram | Wrong or expired API key | Re-check the relevant key in `.env` |
-| `No caller in payment-xxx after 20s` | Outbound SIP trunk misconfigured | Run `python scripts/check_dispatch.py` and verify the trunk SIP URI and credentials |
+| Error | Fix |
+|---|---|
+| `Required environment variable 'X' is not set` | Copy `.env.example` to `.env` and fill in the variable |
+| `LIVEKIT_SIP_OUTBOUND_TRUNK_ID not set` | Run `python scripts/setup_outbound_trunk.py` |
+| Phone rings but agent stays silent | Dispatch rule missing `agentName: payment-agent` in `roomConfig.agents` |
+| `DuplexClosed` mid-greeting | Use `python agent.py start` for phone testing, not `dev` |
+| Call blocked immediately | `scenario` is `grievance_pending` in `scenario_config.json` |
+| Invalid phone in CSV | Use E.164 format with leading `+`; avoid Excel scientific notation |
