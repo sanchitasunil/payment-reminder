@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 
 from dotenv import load_dotenv
@@ -27,10 +28,6 @@ from livekit.agents import (
     cli,
 )
 from livekit.agents.llm import ChatContext
-from livekit.agents import tts as agents_tts
-from livekit.agents.tts import AudioEmitter
-from livekit.agents.types import APIConnectOptions
-from livekit.agents.utils import http_context as _http_ctx
 from livekit.plugins import deepgram, google, openai, silero
 from livekit.plugins import murf
 
@@ -54,8 +51,10 @@ from tools.transcript import (
     infer_intent_from_turns,
     register_call_session,
     save_transcript,
+    save_transcript_local,
     unregister_call_session,
 )
+from tools.whatsapp import send_post_call_whatsapp
 from livekit.agents.voice.events import ConversationItemAddedEvent, UserInputTranscribedEvent
 
 load_dotenv()
@@ -73,12 +72,6 @@ logging.getLogger("hpack").setLevel(logging.WARNING)
 logging.getLogger("hpack.table").setLevel(logging.WARNING)
 logging.getLogger("h2").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-OPENING_LINE = (
-    f"Hello, this is {cfg['agentName']}, an automated payment assistance agent from "
-    f"{cfg['companyName']}. This call may be recorded for quality and compliance. "
-    f"Am I speaking with {cfg['customerName']}?"
-)
 
 
 def _sip_caller_phone(participant: rtc.RemoteParticipant) -> str | None:
@@ -110,90 +103,7 @@ def _update_agent_instructions(
     new_prompt = build_payment_prompt(
         call_cfg, identity_verified, sm.current_state.value, sm.allowed_actions
     )
-    asyncio.create_task(session.agent.update_instructions(new_prompt))
-
-
-# ── Pre-synthesized greeting cache ────────────────────────────────────────────
-
-class _CachedChunkedStream(agents_tts.ChunkedStream):
-    """Replays pre-synthesized PCM frames without calling the TTS API."""
-
-    def __init__(
-        self,
-        *,
-        tts_instance: agents_tts.TTS,
-        input_text: str,
-        frames: list[rtc.AudioFrame],
-        conn_options: APIConnectOptions,
-    ) -> None:
-        super().__init__(tts=tts_instance, input_text=input_text, conn_options=conn_options)
-        self._frames = frames
-
-    async def _run(self, output_emitter: AudioEmitter) -> None:
-        if not self._frames:
-            return
-        first = self._frames[0]
-        output_emitter.initialize(
-            request_id="cached-greeting",
-            sample_rate=first.sample_rate,
-            num_channels=first.num_channels,
-            mime_type="audio/pcm",
-        )
-        for frame in self._frames:
-            output_emitter.push(bytes(frame.data))
-
-
-class CachedGreetingTTS(agents_tts.TTS):
-    """Wraps a TTS and plays pre-cached audio for the opening greeting call."""
-
-    def __init__(
-        self,
-        inner: agents_tts.TTS,
-        greeting_text: str,
-        greeting_frames: list[rtc.AudioFrame],
-    ) -> None:
-        super().__init__(
-            capabilities=inner.capabilities,
-            sample_rate=inner.sample_rate,
-            num_channels=inner.num_channels,
-        )
-        self._inner = inner
-        self._greeting_text = greeting_text
-        self._greeting_frames = greeting_frames
-        self._greeting_used = False
-
-    def synthesize(
-        self,
-        text: str,
-        *,
-        conn_options: APIConnectOptions = APIConnectOptions(),
-    ) -> agents_tts.ChunkedStream:
-        if not self._greeting_used and self._greeting_frames:
-            if text == self._greeting_text:
-                self._greeting_used = True
-                logger.info("Serving pre-cached greeting (no TTS API call)")
-                return _CachedChunkedStream(
-                    tts_instance=self,
-                    input_text=text,
-                    frames=self._greeting_frames,
-                    conn_options=conn_options,
-                )
-            logger.warning(
-                "Greeting cache miss — text mismatch (expected %r… got %r…)",
-                self._greeting_text[:60],
-                text[:60],
-            )
-        return self._inner.synthesize(text, conn_options=conn_options)
-
-    def stream(
-        self,
-        *,
-        conn_options: APIConnectOptions = APIConnectOptions(),
-    ) -> agents_tts.SynthesizeStream:
-        return self._inner.stream(conn_options=conn_options)
-
-    async def aclose(self) -> None:
-        await self._inner.aclose()
+    asyncio.create_task(session.current_agent.update_instructions(new_prompt))
 
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
@@ -218,46 +128,37 @@ class PaymentAgent(Agent):
 
 
 def prewarm(proc: JobProcess) -> None:
-    """Load VAD weights and pre-synthesize the opening greeting before first call."""
+    """Load VAD weights and create the Murf streaming TTS for calls.
+
+    Murf streaming TTFB is sub-second, so we stream the greeting like every other
+    turn (no cache). We hand the framework a *plain* murf.TTS so that the agent's
+    automatic ``tts.prewarm()`` at session start (async) opens the Murf WebSocket
+    early — during the dial/answer wait — instead of connecting lazily mid-call,
+    where it would compete with the SIP answer + STT setup and stall past the 10s
+    connect timeout. (The old CachedGreetingTTS wrapper inherited a no-op prewarm,
+    so its inner Murf pool was never warmed — that caused the mid-call timeouts.)
+    """
     proc.userdata["vad"] = silero.VAD.load()
-
-    # tts_for_calls is kept clean (no asyncio.run() event-loop state).
-    tts_for_calls = murf.TTS(voice=_VOICE, locale=_LOCALE)
-
-    async def _synthesise_greeting() -> list[rtc.AudioFrame]:
-        # Throwaway instance: used only here so tts_for_calls stays uncontaminated.
-        tts_tmp = murf.TTS(voice=_VOICE, locale=_LOCALE)
-        frames: list[rtc.AudioFrame] = []
-        async with _http_ctx.open():
-            async for audio in tts_tmp.synthesize(OPENING_LINE):
-                frames.append(audio.frame)
-        return frames
-
-    try:
-        greeting_frames = asyncio.run(_synthesise_greeting())
-        total_s = sum(f.duration for f in greeting_frames)
-        logger.info(
-            "Greeting pre-synthesized: %d frames, %.1fs audio", len(greeting_frames), total_s
-        )
-        proc.userdata["tts"] = CachedGreetingTTS(tts_for_calls, OPENING_LINE, greeting_frames)
-    except Exception:
-        logger.exception("Greeting pre-synthesis failed, will synthesize on first call")
-        proc.userdata["tts"] = tts_for_calls
+    proc.userdata["tts"] = murf.TTS(voice=_VOICE, locale=_LOCALE, streaming=True)
 
 
 def _is_phone_room(room_name: str) -> bool:
     return room_name.startswith("payment-") and not room_name.startswith("payment-test-")
 
 
-def _get_job_phone(ctx: JobContext) -> str | None:
-    """Return the outbound phone number stored in dispatch metadata by trigger_call.py."""
+def _get_job_metadata(ctx: JobContext) -> dict:
+    """Parse the full dispatch metadata dict (set by run.py)."""
     metadata = getattr(ctx.job, "metadata", None)
     if not metadata:
-        return None
+        return {}
     try:
-        return json.loads(metadata).get("phone_number")
+        return json.loads(metadata)
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return None
+        return {}
+
+
+def _get_job_phone(ctx: JobContext) -> str | None:
+    return _get_job_metadata(ctx).get("phone_number")
 
 
 async def _dial_and_greet(
@@ -266,6 +167,7 @@ async def _dial_and_greet(
     t0: float,
     opening_line: str,
     phone_number: str,
+    text_mode: bool = False,
 ) -> None:
     """Outbound flow: dial the user, wait until they answer, then greet with zero ringback."""
     from livekit import api as lk_api
@@ -327,12 +229,19 @@ async def _dial_and_greet(
             break
 
     try:
-        await asyncio.wait_for(track_ready.wait(), timeout=5.0)
-        logger.info("Audio track ready at %.1fs", time.monotonic() - t0)
+        await asyncio.wait_for(track_ready.wait(), timeout=3.0)
+        logger.info("MEDIA: caller audio track subscribed at %.1fs", time.monotonic() - t0)
     except asyncio.TimeoutError:
-        logger.warning("Audio track not seen in 5s, proceeding anyway")
+        # Inbound track event didn't fire — the media path may still be coming up.
+        # Don't burn another 2s of dead air; greet now after a brief settle.
+        logger.warning("MEDIA: caller audio track NOT detected in 3s (proceeding)")
     finally:
         ctx.room.off("track_subscribed", _on_track_subscribed)
+
+    # Short, consistent settle so the SIP RTP path + LiveKit egress are flowing
+    # before we push the first greeting frame. Whether or not the inbound track
+    # fired, the outbound bridge needs a moment or the first audio is choppy.
+    await asyncio.sleep(0.7)
 
     # Play the greeting BEFORE calling set_participant() so that STT is not yet active.
     # set_participant() activates the input pipeline (VAD + STT); starting it during the
@@ -342,9 +251,12 @@ async def _dial_and_greet(
     await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
     logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
 
-    # Greeting is done — now activate STT so the agent can listen to the user's reply.
-    session.room_io.set_participant(participant.identity)
-    logger.info("STT activated at %.1fs", time.monotonic() - t0)
+    if not text_mode:
+        # Activate STT so the agent can listen to the user's spoken reply.
+        session.room_io.set_participant(participant.identity)
+        logger.info("STT activated at %.1fs", time.monotonic() - t0)
+    else:
+        logger.info("Text mode — STT not activated, waiting for terminal input")
 
 
 async def _greet_phone_caller(
@@ -352,6 +264,7 @@ async def _greet_phone_caller(
     session: AgentSession,
     t0: float,
     opening_line: str,
+    text_mode: bool = False,
 ) -> None:
     """Inbound fallback: SIP participant created by dispatch rule, greet when they join."""
     participant: rtc.RemoteParticipant | None = None
@@ -377,8 +290,45 @@ async def _greet_phone_caller(
     await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
     logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
 
-    session.room_io.set_participant(participant.identity)
-    logger.info("STT activated at %.1fs", time.monotonic() - t0)
+    if not text_mode:
+        session.room_io.set_participant(participant.identity)
+        logger.info("STT activated at %.1fs", time.monotonic() - t0)
+    else:
+        logger.info("Text mode — STT not activated")
+
+
+async def _loop_health_monitor(t0: float, stop: asyncio.Event) -> None:
+    """Detect event-loop starvation / CPU saturation during the call.
+
+    Schedules a 0.25s sleep and measures how late the wake-up actually is.
+    On a healthy loop the lag is ~0ms; if audio is stretched/choppy because the
+    loop is blocked, the lag spikes to hundreds of ms. Also samples process and
+    system CPU so we can tell starvation (high lag) from a slow network.
+    """
+    import psutil
+
+    proc = psutil.Process()
+    proc.cpu_percent(None)   # prime the counter
+    psutil.cpu_percent(None)
+    interval = 0.25
+    worst = 0.0
+    while not stop.is_set():
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+        lag_ms = (time.monotonic() - start - interval) * 1000.0
+        worst = max(worst, lag_ms)
+        if lag_ms > 150:  # anything above ~150ms will audibly break up audio
+            logger.warning(
+                "LOOP LAG %.0fms at %.1fs  (proc CPU %.0f%%, system CPU %.0f%%) "
+                "— event loop is blocked; this is what breaks up the audio",
+                lag_ms, time.monotonic() - t0,
+                proc.cpu_percent(None), psutil.cpu_percent(None),
+            )
+    logger.info("LOOP monitor stopped — worst lag observed: %.0fms", worst)
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -390,9 +340,50 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info("Connected to %s (%.1fs)", ctx.room.name, time.monotonic() - t0)
 
-    # Read fresh from disk so trigger_call.py scenario changes take effect
-    # without restarting the worker.
+    # Diagnostic: watch for event-loop starvation, which stretches/breaks audio.
+    _loop_stop = asyncio.Event()
+    _loop_mon_task = asyncio.create_task(_loop_health_monitor(t0, _loop_stop))
+    ctx.room.on("disconnected", lambda *_: _loop_stop.set())
+
+    # Diagnostic: watch the laptop↔LiveKit media link. If our outbound audio is
+    # garbled despite a healthy event loop, the WebRTC/UDP uplink is the cause —
+    # POOR/LOST quality or reconnecting here is the smoking gun.
+    _CQ_NAME = {0: "POOR", 1: "GOOD", 2: "EXCELLENT", 3: "LOST"}
+    _local_id = ctx.room.local_participant.identity
+
+    def _on_cq(participant: rtc.Participant, quality) -> None:
+        who = "AGENT→cloud uplink" if participant.identity == _local_id else f"{participant.identity}"
+        name = _CQ_NAME.get(int(quality), str(quality))
+        log = logger.warning if int(quality) in (0, 3) else logger.info
+        log("NET: connection quality %s = %s (%.1fs)", who, name, time.monotonic() - t0)
+
+    ctx.room.on("connection_quality_changed", _on_cq)
+    ctx.room.on("reconnecting", lambda *_: logger.warning("NET: RECONNECTING to LiveKit (%.1fs)", time.monotonic() - t0))
+    ctx.room.on("reconnected", lambda *_: logger.warning("NET: reconnected to LiveKit (%.1fs)", time.monotonic() - t0))
+
+    # Start from the on-disk config, then overlay per-call fields from dispatch
+    # metadata (populated by run.py for both single and campaign calls).
     call_cfg = get_config()
+    job_meta = _get_job_metadata(ctx)
+    if job_meta.get("customer_name"):
+        call_cfg = {
+            **call_cfg,
+            "customerName":              job_meta["customer_name"],
+            "amountDue":                 str(job_meta.get("amount_due", call_cfg["amountDue"])),
+            "amountDueFormatted":        job_meta.get("amount_due_formatted", call_cfg["amountDueFormatted"]),
+            "dueDate":                   job_meta.get("due_date", call_cfg["dueDate"]),
+            "daysPastDue":               int(job_meta.get("days_past_due", call_cfg["daysPastDue"])),
+            "accountEnding":             str(job_meta.get("account_ending", call_cfg["accountEnding"])),
+            "registeredMobileLastFour":  str(job_meta.get("registered_mobile_last_four", call_cfg["registeredMobileLastFour"])),
+            "scenario":                  job_meta.get("scenario", call_cfg["scenario"]),
+        }
+
+    text_mode = bool(job_meta.get("text_mode"))
+
+    # Bind this call's config so parallel campaigns each see their own data
+    # (mock_data._effective_config() reads this context var instead of the file).
+    from mock_data import set_call_context_config
+    set_call_context_config(call_cfg)
 
     outcome_log = OutcomeLog(scenario=call_cfg["scenario"])
     ctx.proc.userdata["outcome_log"] = outcome_log
@@ -413,7 +404,7 @@ async def entrypoint(ctx: JobContext) -> None:
         return
 
     outcome_log.call_started = True
-    outcome_log.recording_disclosure_played = True  # OPENING_LINE always includes the disclosure
+    outcome_log.recording_disclosure_played = True  # opening_line always includes the disclosure
 
     tts_instance = ctx.proc.userdata.get("tts") or murf.TTS(voice=_VOICE, locale=_LOCALE)
 
@@ -441,7 +432,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     log_phone = caller_phone.strip() if caller_phone else "unknown"
-    call_session = CallSession(phone=log_phone)
+    call_session = CallSession(phone=log_phone, name=call_cfg["customerName"])
     register_call_session(ctx.room.name, call_session)
     transcript_saved = False
 
@@ -451,8 +442,14 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         transcript_saved = True
         infer_intent_from_turns(call_session)
+        if outcome_log.outcome != "unknown":
+            call_session.call_outcome = outcome_log.outcome
+        elif call_session.call_outcome == "unknown" and outcome_log.payment_link_sent:
+            call_session.call_outcome = "payment_link_sent"
         outcome_log.save_to_file()
+        save_transcript_local(call_session)
         await save_transcript(call_session)
+        await send_post_call_whatsapp(outcome_log, call_session, call_cfg)
         unregister_call_session(ctx.room.name)
 
     def _on_room_disconnected(*_args: object) -> None:
@@ -460,20 +457,17 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.room.on("disconnected", _on_room_disconnected)
 
-    @session.on("user_input_transcribed")
-    def on_user_input_transcribed(event: UserInputTranscribedEvent) -> None:
+    def _process_user_turn(utterance: str) -> None:
+        """Apply state machine transitions and record a user turn. Called from STT and text mode."""
         nonlocal identity_verified
-        utterance = event.transcript
-        if not (event.is_final and utterance):
+        if not utterance:
             return
 
-        # Wrong person check — only relevant before identity is established
         if sm.current_state in (CallState.OPENING_DISCLOSURE, CallState.IDENTITY_VERIFICATION):
             if guardrails.check_wrong_person(utterance, call_cfg["customerName"]):
                 sm.transition(CallState.WRONG_PERSON_END)
                 _update_agent_instructions(session, call_cfg, identity_verified, sm)
 
-        # Guardrail: stop payment flow for dispute / hardship / human request / stop-calling
         if not sm.is_terminal():
             stop, reason = guardrails.should_stop_payment_flow(utterance)
             if stop:
@@ -485,24 +479,46 @@ async def entrypoint(ctx: JobContext) -> None:
                     sm.transition(CallState.HUMAN_HANDOFF)
                 _update_agent_instructions(session, call_cfg, identity_verified, sm)
 
-        # Normal flow: advance OPENING_DISCLOSURE → IDENTITY_VERIFICATION on first user response
-        # (any reply that didn't trigger wrong_person or a stop-flow guardrail)
         if sm.current_state == CallState.OPENING_DISCLOSURE:
             sm.transition(CallState.IDENTITY_VERIFICATION)
             _update_agent_instructions(session, call_cfg, identity_verified, sm)
 
-        # Identity transition hook — fires on the turn after verify_borrower_identity succeeds
         if (
             outcome_log.identity_verified
             and not identity_verified
             and sm.current_state == CallState.IDENTITY_VERIFICATION
         ):
             identity_verified = True
-            outcome_log.amount_disclosed = True  # amount is revealed in PAYMENT_CONTEXT
+            outcome_log.amount_disclosed = True
             sm.transition(CallState.PAYMENT_CONTEXT)
             _update_agent_instructions(session, call_cfg, identity_verified, sm)
 
         call_session.add_turn("user", utterance)
+
+    async def _stdin_reader_task() -> None:
+        """Text mode: read caller responses from stdin and inject into the session."""
+        loop = asyncio.get_event_loop()
+        print("\n[TEXT MODE] Type the caller's response and press Enter (Ctrl+D to end):\n")
+        while ctx.room.isconnected():
+            try:
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+                if not line:  # EOF / Ctrl+D
+                    break
+                text = line.strip()
+                if not text:
+                    continue
+                print(f"[You]: {text}")
+                _process_user_turn(text)
+                await session.generate_reply(user_input=text)
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as exc:
+                logger.warning("Text input error: %s", exc)
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event: UserInputTranscribedEvent) -> None:
+        if event.is_final and event.transcript:
+            _process_user_turn(event.transcript)
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event: ConversationItemAddedEvent) -> None:
@@ -510,6 +526,8 @@ async def entrypoint(ctx: JobContext) -> None:
         if item.type == "message" and item.role == "assistant":
             text = item.text_content
             if text:
+                if text_mode:
+                    print(f"\n[Agent]: {text}\n")
                 prohibited, phrase = guardrails.is_prohibited_language(text)
                 if prohibited:
                     logger.warning(
@@ -523,13 +541,21 @@ async def entrypoint(ctx: JobContext) -> None:
     if is_phone:
         try:
             if outbound_phone:
-                await _dial_and_greet(ctx, session, t0, opening_line, outbound_phone)
+                await _dial_and_greet(ctx, session, t0, opening_line, outbound_phone, text_mode)
             else:
-                await _greet_phone_caller(ctx, session, t0, opening_line)
+                await _greet_phone_caller(ctx, session, t0, opening_line, text_mode)
         except asyncio.TimeoutError:
             logger.error("Phone call timed out")
         except Exception:
             logger.exception("Phone call failed")
+        if text_mode:
+            asyncio.create_task(_stdin_reader_task())
+    elif text_mode:
+        # Test mode: no phone call — print the greeting and take over stdin
+        print(f"\n[Agent]: {opening_line}\n")
+        call_session.add_turn("agent", opening_line)
+        asyncio.create_task(_stdin_reader_task())
+
     while ctx.room.isconnected():
         await asyncio.sleep(0.25)
 

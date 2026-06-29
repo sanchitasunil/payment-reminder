@@ -1,7 +1,7 @@
 {
-  "scenario": "test_run",
+  "scenario": "normal_reminder",
   "call_started": true,
-  "recording_disclosure_played": false,
+  "recording_disclosure_played": true,
   "identity_verified": false,
   "amount_disclosed": false,
   "payment_link_sent": false,

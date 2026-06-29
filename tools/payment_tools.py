@@ -49,7 +49,7 @@ async def send_payment_link(
     outcome_log = _get_outcome_log()
     if outcome_log is not None and not outcome_log.identity_verified:
         return "Cannot send link before identity is verified."
-    cfg = mock_data.get_config()
+    cfg = mock_data._effective_config()
     if not cfg.get("paymentLinkEnabled"):
         return "Payment link sending is not enabled."
     if outcome_log is not None:

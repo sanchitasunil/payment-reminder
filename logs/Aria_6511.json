@@ -1,0 +1,15 @@
+{
+  "name": "Aria",
+  "phone": "+919880026511",
+  "started_at": "2026-06-29T09:29:44.458272+00:00",
+  "duration_seconds": 40,
+  "intent": "general_inquiry",
+  "call_outcome": "unknown",
+  "transcript": [
+    {
+      "role": "agent",
+      "text": "Hello, this is Asha, an automated payment assistance agent from NovaFin. This call may be recorded for quality and compliance. Am I speaking with Aria?",
+      "ts": 17.79
+    }
+  ]
+}

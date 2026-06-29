@@ -80,9 +80,12 @@ def handoff_enabled() -> bool:
     return bool(HUMAN_TRANSFER_NUMBER and LIVEKIT_SIP_URI)
 
 
-# ── Twilio — used for outbound SIP trunk setup (optional at agent runtime) ────
-# These are needed when configuring the Twilio → LiveKit SIP inbound trunk,
-# not during the agent's call handling itself.
+# ── Twilio — SIP trunk setup + post-call WhatsApp (optional at agent runtime) ─
 TWILIO_ACCOUNT_SID: str | None = _optional("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN: str | None = _optional("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER: str | None = _optional("TWILIO_PHONE_NUMBER")
+TWILIO_WHATSAPP_FROM: str | None = _optional("TWILIO_WHATSAPP_FROM")
+
+
+def whatsapp_enabled() -> bool:
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM)

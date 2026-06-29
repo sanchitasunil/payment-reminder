@@ -14,6 +14,7 @@ from livekit.agents import RunContext, function_tool, get_job_context
 from pydantic import Field
 
 import config
+from outcome_log import OutcomeLog
 from tools.transcript import get_call_session
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,11 @@ async def transfer_to_human(
         cs = get_call_session(job_ctx.room.name)
         if cs:
             cs.set_outcome(intent=cs.intent, outcome="transferred_to_human")
+
+        outcome_log: OutcomeLog | None = job_ctx.proc.userdata.get("outcome_log")
+        if outcome_log is not None:
+            outcome_log.human_handoff_required = True
+            outcome_log.outcome = "transferred_to_human"
 
         return "I'm transferring you to a human agent right now. Please hold for a moment."
 
