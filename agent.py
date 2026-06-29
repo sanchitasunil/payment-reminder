@@ -168,14 +168,20 @@ class CachedGreetingTTS(agents_tts.TTS):
         *,
         conn_options: APIConnectOptions = APIConnectOptions(),
     ) -> agents_tts.ChunkedStream:
-        if not self._greeting_used and self._greeting_frames and text == self._greeting_text:
-            self._greeting_used = True
-            logger.info("Serving pre-cached greeting (no TTS API call)")
-            return _CachedChunkedStream(
-                tts_instance=self,
-                input_text=text,
-                frames=self._greeting_frames,
-                conn_options=conn_options,
+        if not self._greeting_used and self._greeting_frames:
+            if text == self._greeting_text:
+                self._greeting_used = True
+                logger.info("Serving pre-cached greeting (no TTS API call)")
+                return _CachedChunkedStream(
+                    tts_instance=self,
+                    input_text=text,
+                    frames=self._greeting_frames,
+                    conn_options=conn_options,
+                )
+            logger.warning(
+                "Greeting cache miss — text mismatch (expected %r… got %r…)",
+                self._greeting_text[:60],
+                text[:60],
             )
         return self._inner.synthesize(text, conn_options=conn_options)
 
@@ -301,11 +307,44 @@ async def _dial_and_greet(
             logger.error("SIP participant didn't appear after answering")
             return
 
-    session.room_io.set_participant(participant.identity)
+    # Wait for the participant's audio track to be subscribed (RTP media path established).
+    # SIP 200 OK fires before the media is flowing, so we must not speak until the track
+    # is confirmed subscribed or the first words are dropped.
+    track_ready = asyncio.Event()
+
+    def _on_track_subscribed(
+        track: rtc.Track,
+        _publication: rtc.RemoteTrackPublication,
+        remote_participant: rtc.RemoteParticipant,
+    ) -> None:
+        if remote_participant.identity == participant.identity and track.kind == rtc.TrackKind.KIND_AUDIO:
+            track_ready.set()
+
+    ctx.room.on("track_subscribed", _on_track_subscribed)
+    for pub in participant.track_publications.values():
+        if pub.subscribed and pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+            track_ready.set()
+            break
+
+    try:
+        await asyncio.wait_for(track_ready.wait(), timeout=5.0)
+        logger.info("Audio track ready at %.1fs", time.monotonic() - t0)
+    except asyncio.TimeoutError:
+        logger.warning("Audio track not seen in 5s, proceeding anyway")
+    finally:
+        ctx.room.off("track_subscribed", _on_track_subscribed)
+
+    # Play the greeting BEFORE calling set_participant() so that STT is not yet active.
+    # set_participant() activates the input pipeline (VAD + STT); starting it during the
+    # greeting causes transcriptions that interrupt or break up the audio.
     handle = session.say(opening_line, allow_interruptions=False)
     logger.info("Greeting started at %.1fs", time.monotonic() - t0)
     await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
     logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
+
+    # Greeting is done — now activate STT so the agent can listen to the user's reply.
+    session.room_io.set_participant(participant.identity)
+    logger.info("STT activated at %.1fs", time.monotonic() - t0)
 
 
 async def _greet_phone_caller(
@@ -333,11 +372,13 @@ async def _greet_phone_caller(
             logger.error("No caller in %s after 20s", ctx.room.name)
             return
 
-    session.room_io.set_participant(participant.identity)
     handle = session.say(opening_line, allow_interruptions=False)
     logger.info("Greeting started at %.1fs", time.monotonic() - t0)
     await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
     logger.info("Opening greeting played at %.1fs", time.monotonic() - t0)
+
+    session.room_io.set_participant(participant.identity)
+    logger.info("STT activated at %.1fs", time.monotonic() - t0)
 
 
 async def entrypoint(ctx: JobContext) -> None:
