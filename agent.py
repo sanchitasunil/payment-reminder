@@ -61,6 +61,8 @@ load_dotenv()
 cfg = get_config()
 _VOICE = cfg["agentVoice"]
 _voice_parts = _VOICE.split("-")
+# Murf voice IDs look like "en-US-natalie"; the locale is the first two segments.
+_LOCALE = "-".join(_voice_parts[:2])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("payment-agent")
