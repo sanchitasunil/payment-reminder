@@ -2,7 +2,7 @@
 Payment reminder system — single entry point.
 
 Single call (audio):
-  python run.py --to +919880026511
+  python run.py --to +911234567890
 
 Campaign from CSV (one call at a time):
   python run.py --csv reminders.csv
@@ -12,11 +12,6 @@ Campaign from CSV (all calls at once):
 
 CSV columns:
   name, phone, amount_due, due_date, account_ending, registered_mobile_last_four
-
-  amount_due_formatted  →  auto-formatted as ₹X,XXX
-  days_past_due         →  auto-calculated from due_date vs today
-  scenario              →  always normal_reminder; the agent's conversation
-                           determines the actual outcome (dispute / hardship / etc.)
 """
 from __future__ import annotations
 
@@ -60,10 +55,10 @@ def _clean_phone(raw: str) -> str:
     if not _E164_RE.match(phone):
         raise ValueError(
             f"Invalid phone number {phone!r}.\n"
-            "  Phone must be in E.164 format: +CountryCodeNumber (e.g. +919880026511).\n"
+            "  Phone must be in E.164 format: +CountryCodeNumber (e.g. +911234567890).\n"
             "  If you edited the CSV in Excel, it likely converted the number to scientific\n"
-            "  notation (e.g. 9.1988E+11). Open the file in Notepad/VS Code instead and\n"
-            "  re-enter the numbers with a leading + and no spaces or dashes."
+            "  notation (e.g. 9.1234E+90). Open the file in Notepad/VS Code instead and\n"
+            "  re-enter the numbers with a leading '+' and no spaces or dashes."
         )
     return phone
 
@@ -107,7 +102,6 @@ def _row_to_meta(row: dict, text_mode: bool = False) -> dict:
         "days_past_due":               _days_past_due(due_date),
         "account_ending":              row["account_ending"].strip(),
         "registered_mobile_last_four": row["registered_mobile_last_four"].strip(),
-        "scenario":                    "normal_reminder",
         "text_mode":                   text_mode,
     }
 
@@ -217,19 +211,20 @@ async def _run_parallel(rows: list[dict]) -> None:
 
 async def _run_single(phone: str, text_mode: bool = False) -> None:
     from livekit import api as lk_api
-    phone = _clean_phone(phone)  
+    phone = _clean_phone(phone)
     with open(_CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
+    amount   = str(cfg["amountDue"])
+    due_date = cfg["dueDate"]
     meta = {
         "phone_number":                phone,
         "customer_name":               cfg["customerName"],
-        "amount_due":                  str(cfg["amountDue"]),
-        "amount_due_formatted":        cfg["amountDueFormatted"],
-        "due_date":                    cfg["dueDate"],
-        "days_past_due":               cfg["daysPastDue"],
+        "amount_due":                  amount,
+        "amount_due_formatted":        _format_inr(amount),
+        "due_date":                    due_date,
+        "days_past_due":               _days_past_due(due_date),
         "account_ending":              str(cfg["accountEnding"]),
         "registered_mobile_last_four": str(cfg["registeredMobileLastFour"]),
-        "scenario":                    cfg["scenario"],
         "text_mode":                   text_mode,
     }
     lk = lk_api.LiveKitAPI(
@@ -283,7 +278,7 @@ async def main() -> None:
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--to", metavar="PHONE",
-                       help="Single call: E.164 phone number, e.g. +919880026511")
+                       help="Single call: E.164 phone number, e.g. +911234567890")
     group.add_argument("--csv", metavar="FILE",
                        help="Campaign CSV file, e.g. reminders.csv")
     group.add_argument("--test", action="store_true",
@@ -299,7 +294,7 @@ async def main() -> None:
     print("=" * 62)
 
     print("\nStarting agent worker …")
-    proc = [_start_agent()]  # list so _run_sequential can reassign on restart
+    proc = [_start_agent()] 
 
     from livekit import api as lk_api
     lk = lk_api.LiveKitAPI(

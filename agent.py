@@ -50,7 +50,6 @@ from tools.transcript import (
     CallSession,
     infer_intent_from_turns,
     register_call_session,
-    save_transcript,
     save_transcript_local,
     unregister_call_session,
 )
@@ -61,16 +60,13 @@ load_dotenv()
 
 cfg = get_config()
 _VOICE = cfg["agentVoice"]
-_LOCALE = "-".join(_VOICE.split("-")[:2])
+_voice_parts = _VOICE.split("-")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("payment-agent")
 logger.setLevel(logging.INFO)
 
-# Suppress HTTP/2 frame-level debug noise from Supabase client
-logging.getLogger("hpack").setLevel(logging.WARNING)
-logging.getLogger("hpack.table").setLevel(logging.WARNING)
-logging.getLogger("h2").setLevel(logging.WARNING)
+# Suppress noisy HTTP client debug logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -92,6 +88,18 @@ async def _resolve_caller_phone(ctx: JobContext, is_phone: bool) -> str | None:
             return phone
 
     return None
+
+
+def _derive_scenario(outcome_log: OutcomeLog, sm: CallStateMachine) -> str:
+    """Derive the call scenario from what actually happened in the conversation,
+    rather than trusting a pre-set value from the config/metadata."""
+    if sm.current_state == CallState.WRONG_PERSON_END:
+        return "wrong_person"
+    if outcome_log.hardship_detected:
+        return "hardship"
+    if outcome_log.dispute_detected:
+        return "already_paid"
+    return "normal_reminder"
 
 
 def _update_agent_instructions(
@@ -129,14 +137,6 @@ class PaymentAgent(Agent):
 
 def prewarm(proc: JobProcess) -> None:
     """Load VAD weights and create the Murf streaming TTS for calls.
-
-    Murf streaming TTFB is sub-second, so we stream the greeting like every other
-    turn (no cache). We hand the framework a *plain* murf.TTS so that the agent's
-    automatic ``tts.prewarm()`` at session start (async) opens the Murf WebSocket
-    early — during the dial/answer wait — instead of connecting lazily mid-call,
-    where it would compete with the SIP answer + STT setup and stall past the 10s
-    connect timeout. (The old CachedGreetingTTS wrapper inherited a no-op prewarm,
-    so its inner Murf pool was never warmed — that caused the mid-call timeouts.)
     """
     proc.userdata["vad"] = silero.VAD.load()
     proc.userdata["tts"] = murf.TTS(voice=_VOICE, locale=_LOCALE, streaming=True)
@@ -446,9 +446,9 @@ async def entrypoint(ctx: JobContext) -> None:
             call_session.call_outcome = outcome_log.outcome
         elif call_session.call_outcome == "unknown" and outcome_log.payment_link_sent:
             call_session.call_outcome = "payment_link_sent"
+        outcome_log.scenario = _derive_scenario(outcome_log, sm)
         outcome_log.save_to_file()
         save_transcript_local(call_session)
-        await save_transcript(call_session)
         await send_post_call_whatsapp(outcome_log, call_session, call_cfg)
         unregister_call_session(ctx.room.name)
 

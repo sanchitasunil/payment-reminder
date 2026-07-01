@@ -19,7 +19,7 @@ TWILIO SETUP (do this first in console.twilio.com):
     TWILIO_SIP_TERM_URI=livekit-outbound.pstn.twilio.com
     TWILIO_SIP_USERNAME=<credential username you chose>
     TWILIO_SIP_PASSWORD=<credential password you chose>
-    TWILIO_PHONE_NUMBER=+18167207794   (already in .env as TWILLIO_PHONE_NUMBER — either works)
+    TWILIO_PHONE_NUMBER=+12015551234   (your Twilio number, also in .env)
 
 Then run:  python scripts/setup_outbound_trunk.py
 """

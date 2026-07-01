@@ -1,12 +1,10 @@
 """
-Call transcript collection and optional Supabase persistence.
-Accumulates speaker turns during a call, saves locally to logs/,
-and optionally persists to Supabase when configured.
+Call transcript collection.
+Accumulates speaker turns during a call and saves locally to logs/.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -15,8 +13,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
-
-import config
 
 logger = logging.getLogger(__name__)
 
@@ -118,55 +114,3 @@ def save_transcript_local(session: CallSession) -> str | None:
         json.dump(data, fh, indent=2, ensure_ascii=False)
     logger.info("Transcript saved: %s", filename)
     return filename
-
-
-async def save_transcript(session: CallSession) -> bool:
-    """
-    Persist the completed call session to Supabase call_logs.
-    No-ops gracefully when Supabase is not configured.
-    """
-    if not config.supabase_enabled():
-        logger.info(
-            "Supabase not configured — transcript not persisted "
-            "(%d turns, outcome=%s)",
-            len(session.turns),
-            session.call_outcome,
-        )
-        return False
-
-    def _save() -> bool:
-        try:
-            from supabase import create_client
-
-            client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)  # type: ignore[arg-type]
-            ended = datetime.now(timezone.utc)
-            started = datetime.fromtimestamp(session.started_at, tz=timezone.utc)
-
-            client.table("call_logs").insert(
-                {
-                    "phone": session.phone,
-                    "started_at": started.isoformat(),
-                    "ended_at": ended.isoformat(),
-                    "duration_seconds": session.duration_seconds(),
-                    "transcript": session.to_transcript_json(),
-                    "intent": session.intent,
-                    "call_outcome": session.call_outcome,
-                }
-            ).execute()
-
-            logger.info(
-                "Transcript saved to Supabase: %d turns, %ss, outcome=%s",
-                len(session.turns),
-                session.duration_seconds(),
-                session.call_outcome,
-            )
-            return True
-        except Exception as exc:
-            logger.error("Supabase transcript save failed: %s", exc)
-            return False
-
-    try:
-        return await asyncio.to_thread(_save)
-    except Exception as exc:
-        logger.error("Supabase transcript save failed: %s", exc)
-        return False

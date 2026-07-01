@@ -61,16 +61,6 @@ if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
 # ── Murf TTS (required) ───────────────────────────────────────────────────────
 MURF_API_KEY: str = _require("MURF_API_KEY")
 
-# ── Supabase — transcript persistence (optional) ──────────────────────────────
-# If not set, call transcripts are logged locally but not persisted to a database.
-SUPABASE_URL: str | None = _optional("SUPABASE_URL")
-SUPABASE_KEY: str | None = _optional("SUPABASE_KEY")
-
-
-def supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
-
-
 # ── Human handoff — SIP transfer to human agent (optional) ────────────────────
 # Set HUMAN_TRANSFER_NUMBER to enable live SIP transfers when the agent escalates.
 HUMAN_TRANSFER_NUMBER: str | None = _optional("HUMAN_TRANSFER_NUMBER")

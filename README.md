@@ -19,7 +19,6 @@ An outbound AI voice agent that calls borrowers, verifies their identity, presen
 - **Stops the payment flow immediately** if the borrower disputes, reports hardship, asks to stop being called, or requests a human
 - **Blocks the call entirely** when the account has an active grievance ticket
 - **Logs structured outcome and transcript files** (`logs/`) after every call
-- **Persists call transcripts** to Supabase when configured
 - **Sends post-call WhatsApp confirmations** via Twilio when configured
 - **Transfers to a human agent** via SIP REFER when escalation is needed
 
@@ -44,7 +43,7 @@ payment-reminder/
 ├── tools/
 │   ├── payment_tools.py  # Agent tools: verify identity, send link, log PTP, etc.
 │   ├── handoff.py        # SIP transfer to human agent
-│   ├── transcript.py     # Transcript collection and Supabase persistence
+│   ├── transcript.py     # Transcript collection (saved to logs/)
 │   └── whatsapp.py       # Post-call WhatsApp confirmations
 ├── scripts/
 │   ├── setup_outbound_trunk.py  # One-time Twilio → LiveKit SIP trunk setup
@@ -125,9 +124,6 @@ python run.py --csv reminders.csv
 
 # Campaign from CSV (parallel — all calls at once)
 python run.py --csv reminders.csv --mode parallel
-
-# Text mode — type the caller's responses in the terminal
-python run.py --to +919876543210 --text
 ```
 
 `run.py` starts the agent worker automatically and dispatches the call.
@@ -158,7 +154,6 @@ python run.py --to +919876543210 --text
 |---|---|
 | `LIVEKIT_SIP_URI` | SIP REFER transfers to a human agent |
 | `HUMAN_TRANSFER_NUMBER` | Phone number to transfer to when the agent escalates |
-| `SUPABASE_URL` / `SUPABASE_KEY` | Persist call transcripts to Supabase |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | WhatsApp confirmations and trunk setup |
 | `TWILIO_PHONE_NUMBER` | Caller ID on outbound calls |
 | `TWILIO_WHATSAPP_FROM` | Post-call WhatsApp sender (e.g. `whatsapp:+14155238886`) |
@@ -173,7 +168,6 @@ Set in `.env` — no code changes needed.
 |---|---|---|
 | `gemini` | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
 | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| `opencode` | `kimi-k2.5` | `OPENCODE_API_KEY` |
 
 | `STT_PROVIDER` | Model | API key |
 |---|---|---|
@@ -267,7 +261,7 @@ python scripts/run_scenario.py --scenario grievance_pending
 | Column | Required | Notes |
 |---|---|---|
 | `name` | yes | Borrower name |
-| `phone` | yes | E.164 format: `+919880026511` |
+| `phone` | yes | E.164 format: `+919876543210` |
 | `amount_due` | yes | Plain integer |
 | `due_date` | yes | e.g. `June 21, 2026` |
 | `account_ending` | yes | Last four digits of account |

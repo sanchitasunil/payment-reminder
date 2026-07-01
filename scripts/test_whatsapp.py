@@ -3,7 +3,7 @@
 Sends a real WhatsApp message by default via Twilio.
 
 Usage:
-  python scripts/test_whatsapp.py --outcome promise_to_pay --phone +919880026511
+  python scripts/test_whatsapp.py --outcome promise_to_pay --phone +910000000001
   python scripts/test_whatsapp.py --outcome hardship --dry-run
   python scripts/test_whatsapp.py --list-outcomes
 
@@ -262,8 +262,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--phone",
-        default="+919880026511",
-        help="Recipient E.164 number (default: +919880026511)",
+        default="+910000000001",
+        help="Recipient E.164 number (default: +910000000001)",
     )
     parser.add_argument(
         "--dry-run",
